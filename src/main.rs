@@ -1,6 +1,6 @@
 mod build;
 
-use anyhow::*;
+use anyhow::Result;
 use build::Build;
 use clap::{Parser, Subcommand};
 use mlua::prelude::*;
@@ -8,14 +8,15 @@ use std::{path::PathBuf, process::ExitCode};
 use tracing::Level;
 use tracing_subscriber::prelude::*;
 
-#[derive(Debug, Subcommand, PartialEq, Eq)]
+#[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
 enum Action {
     Build,
     Run,
     GenDatabase,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
+#[command(version, author, about)]
 struct Cli {
     #[arg(
         id = "input",
@@ -31,6 +32,8 @@ struct Cli {
     full_rebuild: bool,
     #[arg(short, long, global = true)]
     release: bool,
+    #[arg(long, global = true, help = "Print verbose logs")]
+    verbose: bool,
 }
 
 #[tokio::main]
@@ -70,19 +73,23 @@ async fn main() -> Result<ExitCode> {
             if level > 3 {
                 Err(mlua::Error::runtime(message.to_string()?))
             } else {
-                std::result::Result::Ok(())
+                Ok(())
             }
         })?,
     )?;
 
     let chunk = lua.load(args.build_scirpt.clone());
     let out = chunk.eval_async::<LuaFunction>().await?;
-    let b = Build::new(args);
+    let b = Build::new(args.clone());
     let res = out.call_async::<()>(b).await;
-    let exit = if res.is_ok() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
+    let exit = match res {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            if args.verbose {
+                tracing::error!("{e}");
+            }
+            ExitCode::FAILURE
+        }
     };
     Ok(exit)
 }

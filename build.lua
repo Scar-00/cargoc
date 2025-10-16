@@ -4,8 +4,8 @@
 ---@alias OptimizationLevel "Debug" | "Release" | "O0" | "O1" | "O2" | "O3" | "OSize"
 
 ---@class Args
----@field errors ?ErrorFlag[]
----@field no_errors ?ErrorFlag[]
+---@field warnings ?ErrorFlag[]
+---@field no_warnings ?ErrorFlag[]
 ---@field custom ?string[]
 
 ---@class JoinHandle
@@ -22,6 +22,8 @@
 ---@field output ?string
 ---@field src_dir ?string
 ---@field includes ?string[]
+---@field lib_paths ?string[]
+---@field libs ?string[]
 ---@field args ?Args
 ---@field excludes ?string[]
 

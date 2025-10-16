@@ -1,5 +1,5 @@
 use super::graph::{CompilerFlags, ToolChain};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::PathBuf;
 use tokio::process::Command;
 
@@ -55,7 +55,11 @@ impl InputFile {
         self.append_includes(&mut cmd);
 
         tracing::info!("[Compiling]: {}", self.path.display());
-        let out = cmd.spawn()?.wait_with_output().await;
+        let out = cmd
+            .spawn()
+            .context(format!("failed to spawn process: {:?}", cmd.as_std()))?
+            .wait_with_output()
+            .await;
         match out {
             Ok(out) if !out.status.success() => {
                 return Err(anyhow::anyhow!(

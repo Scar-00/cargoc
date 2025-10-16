@@ -5,7 +5,7 @@ use mlua::prelude::*;
 use path_absolutize::Absolutize;
 use serde::{Deserialize, Serialize};
 use std::{ops::DerefMut, path::PathBuf};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::{process::Command, task::JoinHandle};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -129,33 +129,58 @@ impl LuaUserData for Build {
                         None
                     }
                     Ok(mut process) => {
-                        if let (Some(stdout), Some(stderr)) =
+                        if let (Some(mut stdout), Some(mut stderr)) =
                             (process.stdout.take(), process.stderr.take())
                         {
                             tokio::spawn({
-                                let raw_binary = raw_binary.clone();
+                                //let raw_binary = raw_binary.clone();
                                 async move {
-                                    let reader = BufReader::new(stdout);
+                                    /*let mut buf = [0u8; 512];
+                                    while let Ok(read) = stdout.read(&mut buf).await {
+                                        if read == 0 {
+                                            break;
+                                        }
+                                        if let Ok(str) = std::str::from_utf8(&buf[..read]) {
+                                            print!("{str}");
+                                        }
+                                        buf = [0u8; 512];
+                                    }*/
+                                    /*let reader = BufReader::new(stdout);
                                     let mut lines = reader.lines();
                                     while let Ok(Some(line)) = lines.next_line().await {
-                                        println!("[{}]: {}", raw_binary.display(), line);
-                                    }
+                                        let out = format!("[{}]: {}\n", raw_binary.display(), line);
+                                        _ = tokio::io::stdout().write_all(out.as_bytes()).await;
+                                        //println!("[{}]: {}", raw_binary.display(), line);
+                                    }*/
                                 }
                             });
                             tokio::spawn(async move {
-                                let reader = BufReader::new(stderr);
+                                /*let mut buf = [0u8; 512];
+                                while let Ok(read) = stderr.read(&mut buf).await {
+                                    if read == 0 {
+                                        break;
+                                    }
+                                    if let Ok(str) = std::str::from_utf8(&buf[..read]) {
+                                        print!("{str}");
+                                    }
+                                    buf = [0u8; 512];
+                                }*/
+                                /*let reader = BufReader::new(stderr);
                                 let mut lines = reader.lines();
                                 while let Ok(Some(line)) = lines.next_line().await {
-                                    println!("[{}]: {}", raw_binary.display(), line);
-                                }
+                                    let out = format!("[{}]: {}\n", raw_binary.display(), line);
+                                    _ = tokio::io::stderr().write_all(out.as_bytes()).await;
+                                    //println!("[{}]: {}", raw_binary.display(), line);
+                                }*/
                             });
                         }
-                        if let Ok(output) = process.wait_with_output().await {
-                            lua.to_value(&CmdOutput {
+                        if let Ok(output) = process.wait().await {
+                            /*lua.to_value(&CmdOutput {
                                 stdout: String::from_utf8(output.stdout).into_lua_err()?,
                                 stderr: String::from_utf8(output.stderr).into_lua_err()?,
                             })
-                            .ok()
+                            .ok()*/
+                            None::<LuaValue>
                         } else {
                             None
                         }

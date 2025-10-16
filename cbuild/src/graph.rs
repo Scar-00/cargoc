@@ -48,12 +48,20 @@ pub enum ToolChain {
 
 impl ToolChain {
     pub fn platform_default() -> Self {
-        #[cfg(target_os = "windows")]
-        return Self::Msvc;
-        #[cfg(target_os = "linux")]
-        return Self::Msvc;
-        #[cfg(target_os = "macos")]
-        return Self::Msvc;
+        cfg_select! {
+            windows => {
+                Self::Msvc
+            }
+            unix => {
+                Self::Gcc
+            }
+            macos => {
+                Self::Clang
+            }
+            _ => {
+                unimplemented!("ToolChain::platform_default()"),
+            }
+        }
     }
 
     pub fn obj_file_ext(&self) -> &str {
@@ -113,9 +121,10 @@ impl ToolChain {
             (Self::Gcc, BinaryType::Executable) => "gcc",
             (Self::Clang, BinaryType::Executable) => "clang",
             (Self::Msvc, BinaryType::Executable) => "link.exe",
+            (Self::Msvc, BinaryType::StaticLib) => "lib.exe",
             (Self::Zig, BinaryType::Executable) => "zig",
             (Self::Custom { linker, .. }, _) => linker,
-            (chain, typ) => unimplemented!("{chain:?}, {typ:?}"),
+            (chain, typ) => unimplemented!("linker: {chain:?}, {typ:?}"),
         }
     }
 
@@ -123,6 +132,13 @@ impl ToolChain {
         match self {
             Self::Gcc | Self::Clang | Self::Zig | Self::Custom { .. } => "-o",
             Self::Msvc => "/OUT:"
+        }
+    }
+
+    pub fn linker_link_dir_flag(&self) -> &str {
+        match self {
+            Self::Gcc | Self::Clang | Self::Zig | Self::Custom { .. } => "-L",
+            Self::Msvc => unimplemented!("msvc: linker_link_dir_flag()"),
         }
     }
 }
@@ -185,6 +201,10 @@ pub struct Graph {
     src_dir: PathBuf,
     #[serde(default = "Vec::new")]
     includes: Vec<PathBuf>,
+    #[serde(default = "Vec::new")]
+    pub lib_paths: Vec<String>,
+    #[serde(default = "Vec::new")]
+    pub libs: Vec<String>,
     #[serde(default = "CompilerFlags::default")]
     args: CompilerFlags,
     excludes: Option<Vec<PathBuf>>,
@@ -299,6 +319,10 @@ impl Graph {
         if self.tool_chain == ToolChain::Msvc {
             cmd.arg("/nologo");
         }
+        cmd.args(&self.libs);
+        self.lib_paths.iter().for_each(|path| {
+            cmd.arg(format!("{}{}", self.tool_chain.linker_link_dir_flag(), path));
+        });
     }
 
     fn should_recompile(&self, files: &[OutputFile]) -> Result<bool> {
@@ -320,7 +344,12 @@ impl Graph {
 
     fn output(&self) -> PathBuf {
         if cfg!(target_os = "windows") {
-            self.output.with_extension("exe")
+            let ext = match self.typ {
+                BinaryType::Executable => "exe",
+                BinaryType::DynLib => "dll",
+                BinaryType::StaticLib => "lib",
+            };
+            self.output.with_extension(ext)
         }else {
             self.output.clone()
         }
