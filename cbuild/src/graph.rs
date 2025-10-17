@@ -5,7 +5,7 @@ use tokio::{
     fs::{self, read_dir}, process::Command, task::JoinSet
 };
 
-use crate::file::{InputFile, OutputFile};
+use crate::{file::{InputFile, OutputFile}, CommandExt};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Os {
@@ -149,6 +149,13 @@ impl ToolChain {
         match self {
             Self::Gcc | Self::Clang | Self::Zig | Self::Custom { .. } => "-o",
             Self::Msvc => "/OUT:"
+        }
+    }
+
+    pub fn linker_link_lib(&self) -> &str {
+        match self {
+            Self::Gcc | Self::Clang | Self::Zig | Self::Custom { .. } => "-l",
+            Self::Msvc => unimplemented!("msvc: linker_link_dir_flag()"),
         }
     }
 
@@ -303,8 +310,10 @@ impl Graph {
         self.append_out(&mut cmd);
         self.append_files(&mut cmd, files);
         self.append_args(&mut cmd);
+        self.append_libs(&mut cmd);
 
         tracing::info!("[Linking]: {}", self.output().display());
+        tracing::debug!("[Linking]: Command = {}", cmd.display());
         let out = cmd.spawn()?.wait().await;
         match out {
             Ok(out) if !out.success() => {
@@ -336,7 +345,13 @@ impl Graph {
         if self.tool_chain == ToolChain::Msvc {
             cmd.arg("/nologo");
         }
-        cmd.args(&self.libs);
+        cmd.args(&self.args.custom);
+    }
+
+    fn append_libs(&self, cmd: &mut Command) {
+        self.libs.iter().for_each(|path| {
+            cmd.arg(format!("{}{}", self.tool_chain.linker_link_lib(), path));
+        });
         self.lib_paths.iter().for_each(|path| {
             cmd.arg(format!("{}{}", self.tool_chain.linker_link_dir_flag(), path));
         });

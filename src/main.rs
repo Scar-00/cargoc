@@ -80,8 +80,10 @@ async fn main() -> Result<ExitCode> {
 
     let chunk = lua.load(args.build_scirpt.clone());
     let out = chunk.eval_async::<LuaFunction>().await?;
-    let b = Build::new(args.clone());
-    let res = out.call_async::<()>(b).await;
+    let build = Build::new(args.clone());
+    let build = lua.create_userdata(build)?;
+    let res = out.call_async::<()>(&build).await;
+    //println!("{:#?}", build.borrow::<Build>());
     let exit = match res {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {

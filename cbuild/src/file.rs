@@ -1,3 +1,5 @@
+use crate::CommandExt;
+
 use super::graph::{CompilerFlags, ToolChain};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -55,6 +57,7 @@ impl InputFile {
         self.append_includes(&mut cmd);
 
         tracing::info!("[Compiling]: {}", self.path.display());
+        tracing::debug!("[Compiling]: Command = {}", cmd.display());
         let out = cmd
             .spawn()
             .context(format!("failed to spawn process: {:?}", cmd.as_std()))?

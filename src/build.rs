@@ -3,16 +3,9 @@ use cbuild::graph::{OptimizationLevel, Os};
 use cbuild::{graph::ToolChain, *};
 use mlua::prelude::*;
 use path_absolutize::Absolutize;
-use serde::{Deserialize, Serialize};
 use std::{ops::DerefMut, path::PathBuf};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::{process::Command, task::JoinHandle};
-
-#[derive(Debug, Serialize, Deserialize)]
-struct CmdOutput {
-    stdout: String,
-    stderr: String,
-}
 
 pub enum TargetHandle {
     InProgress(JoinHandle<Result<PathBuf>>),
@@ -107,7 +100,7 @@ impl LuaUserData for Build {
         });
         methods.add_async_method(
             "run",
-            async |lua, _, (binary, args): (PathBuf, Option<Vec<String>>)| {
+            async |_, _, (binary, args): (PathBuf, Option<Vec<String>>)| {
                 let args = args.unwrap_or(Vec::new());
                 let raw_binary = binary.clone();
                 let binary = binary
@@ -155,13 +148,8 @@ impl LuaUserData for Build {
                                 }
                             });
                         }
-                        if let Ok(output) = process.wait().await {
-                            /*lua.to_value(&CmdOutput {
-                                stdout: String::from_utf8(output.stdout).into_lua_err()?,
-                                stderr: String::from_utf8(output.stderr).into_lua_err()?,
-                            })
-                            .ok()*/
-                            None::<LuaValue>
+                        if let Ok(status) = process.wait().await {
+                            Some(status.success())
                         } else {
                             None
                         }

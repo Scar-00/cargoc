@@ -1,3 +1,4 @@
+---@meta
 ---@alias ToolChain "Msvc" | "Gcc" | "Clang" | "Zig" | { compiler: string, linker: string }
 ---@alias BinaryType "Executable" | "DynLib" | "StaticLib"
 ---@alias ErrorFlag "Error" | "Pedantic" | "Extra" | "All" | "DeprecatedDeclarations"
@@ -28,15 +29,11 @@
 ---@field args ?Args
 ---@field excludes ?string[]
 
----@class CmdOutput
----@field stdout string
----@field stderr string
-
 ---@class Build
 ---@field add_binary fun(self: Build, binary: Graph): Binary
 ---@field install async fun(self: Build, join_handle: JoinHandle): string?
 ---@field default_toolchain fun(self: Build): ToolChain
 ---@field default_opt_level fun(self: Build): OptimizationLevel
 ---@field wants_run fun(self: Build): boolean
----@field run async fun(self: Build, binary: string, args: string[]?): CmdOutput?
+---@field run async fun(self: Build, binary: string, args: string[]?): boolean
 ---@field host_os fun(self: Build): Os
