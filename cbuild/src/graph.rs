@@ -8,6 +8,28 @@ use tokio::{
 use crate::file::{InputFile, OutputFile};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Os {
+    Window,
+    Linux,
+    MacOs,
+    UnixLike,
+}
+
+impl Os {
+    pub fn current() -> Self {
+        if cfg!(target_os = "windows") {
+            Self::Window
+        }else if cfg!(target_os = "linux") {
+            Self::Linux
+        }else if cfg!(target_os = "macos") {
+            Self::MacOs
+        }else {
+            unimplemented!("Os::Current")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum OptimizationLevel {
     Debug,
     Release,
@@ -48,19 +70,14 @@ pub enum ToolChain {
 
 impl ToolChain {
     pub fn platform_default() -> Self {
-        cfg_select! {
-            windows => {
-                Self::Msvc
-            }
-            unix => {
-                Self::Gcc
-            }
-            macos => {
-                Self::Clang
-            }
-            _ => {
-                unimplemented!("ToolChain::platform_default()"),
-            }
+        if cfg!(target_os = "windows") {
+            ToolChain::Msvc
+        }else if cfg!(target_os = "linux") {
+            ToolChain::Gcc
+        }else if cfg!(target_os = "macos") {
+            ToolChain::Clang
+        }else {
+            unimplemented!("ToolChain::platform_default()")
         }
     }
 
@@ -288,9 +305,9 @@ impl Graph {
         self.append_args(&mut cmd);
 
         tracing::info!("[Linking]: {}", self.output().display());
-        let out = cmd.spawn()?.wait_with_output().await;
+        let out = cmd.spawn()?.wait().await;
         match out {
-            Ok(out) if !out.status.success() => {
+            Ok(out) if !out.success() => {
                 return Err(anyhow::anyhow!("failed to link `{}`; compilation aborted", self.output.display()));
             }
             Err(e) => {

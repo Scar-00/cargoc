@@ -58,10 +58,10 @@ impl InputFile {
         let out = cmd
             .spawn()
             .context(format!("failed to spawn process: {:?}", cmd.as_std()))?
-            .wait_with_output()
+            .wait()
             .await;
         match out {
-            Ok(out) if !out.status.success() => {
+            Ok(out) if !out.success() => {
                 return Err(anyhow::anyhow!(
                     "failed to compile `{}`; compilation aborted",
                     self.path.display()

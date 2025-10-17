@@ -1,5 +1,5 @@
 use anyhow::Result;
-use cbuild::graph::OptimizationLevel;
+use cbuild::graph::{OptimizationLevel, Os};
 use cbuild::{graph::ToolChain, *};
 use mlua::prelude::*;
 use path_absolutize::Absolutize;
@@ -99,6 +99,9 @@ impl LuaUserData for Build {
             };
             lua.to_value(&opt_lvl)
         });
+        methods.add_method("host_os", |lua, _, _: ()| {
+            lua.to_value(&Os::current())
+        });
         methods.add_method("wants_run", |_, this, _: ()| {
             Ok(this.args.command == crate::Action::Run)
         });
@@ -129,49 +132,27 @@ impl LuaUserData for Build {
                         None
                     }
                     Ok(mut process) => {
-                        if let (Some(mut stdout), Some(mut stderr)) =
+                        if let (Some(stdout), Some(stderr)) =
                             (process.stdout.take(), process.stderr.take())
                         {
                             tokio::spawn({
-                                //let raw_binary = raw_binary.clone();
+                                let raw_binary = raw_binary.clone();
                                 async move {
-                                    /*let mut buf = [0u8; 512];
-                                    while let Ok(read) = stdout.read(&mut buf).await {
-                                        if read == 0 {
-                                            break;
-                                        }
-                                        if let Ok(str) = std::str::from_utf8(&buf[..read]) {
-                                            print!("{str}");
-                                        }
-                                        buf = [0u8; 512];
-                                    }*/
-                                    /*let reader = BufReader::new(stdout);
+                                    let reader = BufReader::new(stdout);
                                     let mut lines = reader.lines();
                                     while let Ok(Some(line)) = lines.next_line().await {
                                         let out = format!("[{}]: {}\n", raw_binary.display(), line);
                                         _ = tokio::io::stdout().write_all(out.as_bytes()).await;
-                                        //println!("[{}]: {}", raw_binary.display(), line);
-                                    }*/
+                                    }
                                 }
                             });
                             tokio::spawn(async move {
-                                /*let mut buf = [0u8; 512];
-                                while let Ok(read) = stderr.read(&mut buf).await {
-                                    if read == 0 {
-                                        break;
-                                    }
-                                    if let Ok(str) = std::str::from_utf8(&buf[..read]) {
-                                        print!("{str}");
-                                    }
-                                    buf = [0u8; 512];
-                                }*/
-                                /*let reader = BufReader::new(stderr);
+                                let reader = BufReader::new(stderr);
                                 let mut lines = reader.lines();
                                 while let Ok(Some(line)) = lines.next_line().await {
                                     let out = format!("[{}]: {}\n", raw_binary.display(), line);
                                     _ = tokio::io::stderr().write_all(out.as_bytes()).await;
-                                    //println!("[{}]: {}", raw_binary.display(), line);
-                                }*/
+                                }
                             });
                         }
                         if let Ok(output) = process.wait().await {
