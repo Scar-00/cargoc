@@ -233,7 +233,7 @@ pub struct Graph {
     args: CompilerFlags,
     excludes: Option<Vec<PathBuf>>,
     #[serde(skip)]
-    pub full_rebuild: bool
+    pub full_rebuild: bool,
 }
 
 impl Graph {

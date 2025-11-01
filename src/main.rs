@@ -1,5 +1,4 @@
 mod build;
-
 use anyhow::Result;
 use build::Build;
 use clap::{Parser, Subcommand};
@@ -56,7 +55,6 @@ async fn main() -> Result<ExitCode> {
         .init();
 
     let args = Cli::parse();
-
     let lua = Lua::new();
 
     lua.globals().set(
@@ -83,7 +81,6 @@ async fn main() -> Result<ExitCode> {
     let build = Build::new(args.clone());
     let build = lua.create_userdata(build)?;
     let res = out.call_async::<()>(&build).await;
-    //println!("{:#?}", build.borrow::<Build>());
     let exit = match res {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
