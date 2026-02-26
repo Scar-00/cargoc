@@ -12,11 +12,14 @@
 
 ---@class JoinHandle
 
+---@class BuildArtifact
+
 ---@class Binary
 ---@field build async fun(self: Binary): JoinHandle
----@field build_and_install async fun(self: Binary): string?
+---@field build_and_install async fun(self: Binary): BuildArtifact
 
 ---@class Graph
+---@field name string
 ---@field tool_chain ToolChain
 ---@field opt_level OptimizationLevel
 ---@field type ?BinaryType
@@ -35,5 +38,7 @@
 ---@field default_toolchain fun(self: Build): ToolChain
 ---@field default_opt_level fun(self: Build): OptimizationLevel
 ---@field wants_run fun(self: Build): boolean
----@field run async fun(self: Build, binary: string, args: string[]?): boolean
+---@field run async fun(self: Build, binary: BuildArtifact, args: string[]?): boolean
 ---@field host_os fun(self: Build): Os
+---@field should_generate_database fun(self: Build): boolean
+---@field generate_database fun(self: Build, path: string?): boolean

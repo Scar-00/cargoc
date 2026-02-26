@@ -1,8 +1,8 @@
-use crate::CommandExt;
+use crate::{CommandExt, database::Entry};
 
 use super::graph::{CompilerFlags, ToolChain};
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 #[derive(Debug)]
@@ -36,6 +36,32 @@ impl InputFile {
             output_path,
             includes,
             full_rebuild,
+        }
+    }
+
+    pub fn database_entry<'a>(&'a self, dir: PathBuf) -> Entry {
+        let len = self.args.warnings.len()
+            + self.args.no_warnings.len()
+            + self.args.custom.len()
+            + self.includes.len();
+        let mut args = Vec::with_capacity(len);
+        self.args.warnings.iter().for_each(|warning| {
+            args.push(format!("-W{}", warning.to_string(&ToolChain::Clang)));
+        });
+        self.args.no_warnings.iter().for_each(|warning| {
+            args.push(format!("-Wno-{}", warning.to_string(&ToolChain::Clang)));
+        });
+        self.args.custom.iter().for_each(|custom| {
+            args.push(custom.clone());
+        });
+        self.includes.iter().for_each(|include| {
+            args.push(format!("-I{}", include.display()));
+        });
+        Entry {
+            directory: dir,
+            file: self.path.clone(),
+            output: self.output_path.clone(),
+            arguments: args,
         }
     }
 

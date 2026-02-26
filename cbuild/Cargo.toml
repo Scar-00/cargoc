@@ -10,3 +10,4 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 mlua = { workspace = true }
+sha2 = "0.10.9"
