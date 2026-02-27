@@ -4,8 +4,9 @@ use std::{path::{Path, PathBuf}};
 use tokio::{
     fs::{self, read_dir}, process::Command, task::JoinSet
 };
+use sha2::{Digest, Sha224};
 
-use crate::{file::{InputFile, OutputFile}, CommandExt};
+use crate::{file::{InputFile, OutputFile}, CommandExt, database::*};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Os {
@@ -214,6 +215,7 @@ fn default_output() -> PathBuf {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Graph {
+    pub name: String,
     tool_chain: ToolChain,
     opt_level: OptimizationLevel,
     #[serde(rename = "type", default = "default_binary_type")]
@@ -233,13 +235,24 @@ pub struct Graph {
     args: CompilerFlags,
     excludes: Option<Vec<PathBuf>>,
     #[serde(skip)]
-    pub full_rebuild: bool,
+    pub full_rebuild: bool
 }
 
 impl Graph {
     const CACHE_DIR: &'static str = ".cargoc";
     const OBJ_DIR: &'static str = "obj";
     //const BIN_DIR: &'static str = "bin";
+
+    pub async fn database<'a>(&'a self) -> Result<Database> {
+        let cwd = std::env::current_dir()?;
+        let input_files = self.input_files().await?;
+
+        Ok(Database {
+            entries: input_files.iter().map(|file| {
+                file.database_entry(cwd.clone())
+            }).collect()
+        })
+    }
 
     pub async fn build(&self) -> Result<PathBuf> {
         if let Ok(exists) = fs::try_exists(Self::CACHE_DIR).await && !exists {
@@ -250,32 +263,8 @@ impl Graph {
             fs::create_dir(&obj_dir).await?;
         }
 
-        let mut input_files = Vec::with_capacity(self.files.len());
+        let input_files = self.input_files().await?;
 
-        let files = if let Some(excludes) = &self.excludes {
-            self.files.iter().filter(|file| !excludes.contains(file)).collect::<Vec<_>>()
-        }else {
-            self.files.iter().collect()
-        };
-
-        for file in files {
-            if file.is_dir() {
-                input_files.extend(Self::read_dir(file).await?)
-            } else {
-                input_files.push(file.clone());
-            }
-        }
-        let input_files = input_files
-            .into_iter()
-            .map(|file| {
-                let output = file.strip_prefix(&self.src_dir).unwrap_or(&file);
-                let output = Path::new(Self::CACHE_DIR).join(Self::OBJ_DIR).join(output).with_extension(self.tool_chain.obj_file_ext());
-                (file, output)
-            })
-            .map(|(input, output)| {
-                InputFile::new(input, output, self.tool_chain.clone(), self.args.clone(), self.includes.clone(), self.full_rebuild)
-            })
-            .collect::<Vec<_>>();
         for file in &input_files {
             if let Some(dir) = file.output_path.parent() && let Ok(exists) = fs::try_exists(dir).await && !exists {
                 fs::create_dir_all(dir).await?;
@@ -326,6 +315,43 @@ impl Graph {
         }
 
         Ok(self.output())
+    }
+
+    async fn input_files(&self) -> Result<Vec<InputFile>> {
+        let mut input_files = Vec::with_capacity(self.files.len());
+
+        let files = if let Some(excludes) = &self.excludes {
+            self.files.iter().filter(|file| !excludes.contains(file)).collect::<Vec<_>>()
+        }else {
+            self.files.iter().collect()
+        };
+
+        for file in files {
+            if file.is_dir() {
+                input_files.extend(Self::read_dir(file).await?)
+            } else {
+                input_files.push(file.clone());
+            }
+        }
+
+        let mut hasher = Sha224::new();
+
+        let input_files = input_files
+            .into_iter()
+            .map(|file| {
+                hasher.update(file.display().to_string().as_bytes());
+                let output = format!("{}-{:X}", file.with_extension("").display(), hasher.finalize_reset());
+                let output = Path::new(Self::CACHE_DIR)
+                    .join(Self::OBJ_DIR)
+                    .join(output)
+                    .with_extension(self.tool_chain.obj_file_ext());
+                (file, output)
+            })
+            .map(|(input, output)| {
+                InputFile::new(input, output, self.tool_chain.clone(), self.args.clone(), self.includes.clone(), self.full_rebuild)
+            })
+            .collect::<Vec<_>>();
+        Ok(input_files)
     }
 
     fn append_out(&self, cmd: &mut Command) {

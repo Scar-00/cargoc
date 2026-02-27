@@ -10,6 +10,7 @@ return function (build)
     end
 
     local main = build:add_binary({
+        name = "main",
         tool_chain = tool_chain,
         opt_level = build:default_opt_level(),
         files = {

@@ -7,15 +7,30 @@ use std::{ops::DerefMut, path::PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::{process::Command, task::JoinHandle};
 
+#[derive(Debug, Clone)]
+pub struct BuildArtifact {
+    name: String,
+    path: Option<PathBuf>,
+}
+
+impl LuaUserData for BuildArtifact {
+    fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("name", |_, this, _: ()| {
+            Ok(this.name.clone())
+        });
+    }
+}
+
 pub enum TargetHandle {
-    InProgress(JoinHandle<Result<PathBuf>>),
-    Done(Option<PathBuf>),
+    InProgress(JoinHandle<Option<BuildArtifact>>),
+    Done(Option<BuildArtifact>),
 }
 
 impl LuaUserData for TargetHandle {}
 
 #[derive(Debug)]
 pub struct Graph {
+    args: crate::Cli,
     inner: graph::Graph,
 }
 
@@ -23,12 +38,33 @@ impl LuaUserData for Graph {
     fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("build", |_, this, _: ()| {
             let graph = this.inner.clone();
+            if this.args.command.parse_only() {
+                return Ok(TargetHandle::InProgress(tokio::spawn(async move {
+                    BuildArtifact {
+                        name: graph.name.clone(),
+                        path: None,
+                    }
+                })));
+            }
             Ok(TargetHandle::InProgress(tokio::spawn(async move {
-                graph.build().await
+                BuildArtifact {
+                    name: graph.name.clone(),
+                    path: graph.build().await.ok()
+                }
             })))
         });
         methods.add_async_method("build_and_install", async |_, this, _: ()| {
-            this.inner.build().await.into_lua_err()
+            if this.args.command.parse_only() {
+                Ok(BuildArtifact{
+                    name: this.inner.name.clone(),
+                    path: None,
+                })
+            }else {
+                Ok(BuildArtifact{
+                    name: this.inner.name.clone(),
+                    path: this.inner.build().await.ok(),
+                })
+            }
         });
     }
 }
@@ -36,7 +72,7 @@ impl LuaUserData for Graph {
 #[derive(Debug)]
 pub struct Build {
     args: crate::Cli,
-    binaries: Vec<Graph>,
+    pub binaries: Vec<Graph>,
 }
 
 impl Build {
@@ -49,10 +85,14 @@ impl Build {
 
     pub async fn generate_database(
         _: Lua,
-        _: LuaUserDataRef<Self>,
-        _: Option<PathBuf>,
+        this: LuaUserDataRef<Self>,
+        path: Option<PathBuf>,
     ) -> LuaResult<bool> {
-        Ok(true)
+        let database = this.binaries[0].inner.database().await.into_lua_err()?;
+        let Ok(str) = serde_json::to_string_pretty(&database).into_lua_err() else {
+            return Ok(false);
+        };
+        Ok(tokio::fs::write(path.unwrap_or("compile_commands.json".into()), str).await.is_ok())
     }
 }
 
@@ -62,23 +102,23 @@ impl LuaUserData for Build {
             let mut graph = lua.from_value::<graph::Graph>(args)?;
             graph.full_rebuild = this.args.full_rebuild;
             this.binaries.push(Graph {
+                args: this.args.clone(),
                 inner: graph.clone(),
             });
-            let graph = Graph { inner: graph };
-            Ok(graph)
+            Ok(Graph { args: this.args.clone(), inner: graph })
         });
         methods.add_async_method_mut(
             "install",
             async |_, _, mut arg: LuaUserDataRefMut<TargetHandle>| {
-                let path = match arg.deref_mut() {
+                let artifact = match arg.deref_mut() {
                     TargetHandle::InProgress(handle) => {
-                        let path = handle.await.into_lua_err()?.ok();
-                        *arg = TargetHandle::Done(path.clone());
-                        path
+                        let artifact = handle.await.into_lua_err()?;
+                        *arg = TargetHandle::Done(artifact.clone());
+                        artifact
                     }
-                    TargetHandle::Done(path) => path.clone(),
+                    TargetHandle::Done(artifact) => artifact.clone(),
                 };
-                Ok(path)
+                Ok(artifact)
             },
         );
         methods.add_method("default_toolchain", |lua, _, _: ()| {
@@ -100,7 +140,11 @@ impl LuaUserData for Build {
         });
         methods.add_async_method(
             "run",
-            async |_, _, (binary, args): (PathBuf, Option<Vec<String>>)| {
+            async |_, _, (binary, args): (LuaUserDataRef<BuildArtifact>, Option<Vec<String>>)| {
+                use std::process::Stdio;
+                let Some(binary) = binary.path.clone() else {
+                    return Ok(None);
+                };
                 let args = args.unwrap_or(Vec::new());
                 let raw_binary = binary.clone();
                 let binary = binary
@@ -108,8 +152,8 @@ impl LuaUserData for Build {
                     .map(|path| path.to_path_buf())
                     .unwrap_or(binary);
                 let mut cmd = Command::new(&binary);
-                cmd.stdout(std::process::Stdio::piped());
-                cmd.stderr(std::process::Stdio::piped());
+                cmd.stdout(Stdio::piped());
+                cmd.stderr(Stdio::piped());
                 cmd.args(&args);
                 {
                     let mut cmd = format!("\"{}\"", binary.display());

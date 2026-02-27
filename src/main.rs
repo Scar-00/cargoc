@@ -1,10 +1,11 @@
 mod build;
+
 use anyhow::Result;
 use build::Build;
 use clap::{Parser, Subcommand};
 use mlua::prelude::*;
 use std::{path::PathBuf, process::ExitCode};
-use tracing::Level;
+use tracing::{Level, level_filters::LevelFilter};
 use tracing_subscriber::prelude::*;
 
 #[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
@@ -12,6 +13,16 @@ enum Action {
     Build,
     Run,
     GenDatabase,
+    Clean
+}
+
+impl Action {
+    pub fn parse_only(&self) -> bool {
+        match self {
+            Action::GenDatabase | Action::Clean => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -37,6 +48,14 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
+    let args = Cli::parse();
+
+    let level = if args.verbose {
+        LevelFilter::TRACE
+    }else {
+        LevelFilter::INFO
+    };
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -44,7 +63,7 @@ async fn main() -> Result<ExitCode> {
                 .with_target(false)
                 .without_time(),
         )
-        .with(tracing_subscriber::filter::LevelFilter::TRACE)
+        .with(level)
         .with(tracing_subscriber::filter::filter_fn(|meta| {
             if let Some(path) = meta.module_path() {
                 path != "mio::poll"
@@ -54,7 +73,6 @@ async fn main() -> Result<ExitCode> {
         }))
         .init();
 
-    let args = Cli::parse();
     let lua = Lua::new();
 
     lua.globals().set(
@@ -81,6 +99,7 @@ async fn main() -> Result<ExitCode> {
     let build = Build::new(args.clone());
     let build = lua.create_userdata(build)?;
     let res = out.call_async::<()>(&build).await;
+    //println!("{:#?}", build.borrow::<Build>());
     let exit = match res {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {

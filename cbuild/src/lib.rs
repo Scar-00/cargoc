@@ -1,5 +1,6 @@
 pub mod file;
 pub mod graph;
+pub mod database;
 
 pub trait CommandExt {
     fn display(&self) -> String;
