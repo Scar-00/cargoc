@@ -15,9 +15,7 @@ pub struct BuildArtifact {
 
 impl LuaUserData for BuildArtifact {
     fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("name", |_, this, _: ()| {
-            Ok(this.name.clone())
-        });
+        methods.add_method("name", |_, this, _: ()| Ok(this.name.clone()));
     }
 }
 
@@ -40,27 +38,27 @@ impl LuaUserData for Graph {
             let graph = this.inner.clone();
             if this.args.command.parse_only() {
                 return Ok(TargetHandle::InProgress(tokio::spawn(async move {
-                    BuildArtifact {
+                    Some(BuildArtifact {
                         name: graph.name.clone(),
                         path: None,
-                    }
+                    })
                 })));
             }
             Ok(TargetHandle::InProgress(tokio::spawn(async move {
-                BuildArtifact {
+                Some(BuildArtifact {
                     name: graph.name.clone(),
-                    path: graph.build().await.ok()
-                }
+                    path: graph.build().await.ok(),
+                })
             })))
         });
         methods.add_async_method("build_and_install", async |_, this, _: ()| {
             if this.args.command.parse_only() {
-                Ok(BuildArtifact{
+                Ok(BuildArtifact {
                     name: this.inner.name.clone(),
                     path: None,
                 })
-            }else {
-                Ok(BuildArtifact{
+            } else {
+                Ok(BuildArtifact {
                     name: this.inner.name.clone(),
                     path: this.inner.build().await.ok(),
                 })
@@ -92,7 +90,11 @@ impl Build {
         let Ok(str) = serde_json::to_string_pretty(&database).into_lua_err() else {
             return Ok(false);
         };
-        Ok(tokio::fs::write(path.unwrap_or("compile_commands.json".into()), str).await.is_ok())
+        Ok(
+            tokio::fs::write(path.unwrap_or("compile_commands.json".into()), str)
+                .await
+                .is_ok(),
+        )
     }
 }
 
@@ -105,7 +107,10 @@ impl LuaUserData for Build {
                 args: this.args.clone(),
                 inner: graph.clone(),
             });
-            Ok(Graph { args: this.args.clone(), inner: graph })
+            Ok(Graph {
+                args: this.args.clone(),
+                inner: graph,
+            })
         });
         methods.add_async_method_mut(
             "install",
@@ -132,9 +137,7 @@ impl LuaUserData for Build {
             };
             lua.to_value(&opt_lvl)
         });
-        methods.add_method("host_os", |lua, _, _: ()| {
-            lua.to_value(&Os::current())
-        });
+        methods.add_method("host_os", |lua, _, _: ()| lua.to_value(&Os::current()));
         methods.add_method("wants_run", |_, this, _: ()| {
             Ok(this.args.command == crate::Action::Run)
         });
