@@ -17,6 +17,10 @@
 ---@class Binary
 ---@field build async fun(self: Binary): JoinHandle
 ---@field build_and_install async fun(self: Binary): BuildArtifact
+---@field export fun(self: Binary, name: string?): Binary
+
+---@class Project
+---@field artifact fun(self: Project, name: string): Binary
 
 ---@class Graph
 ---@field name string
@@ -26,7 +30,9 @@
 ---@field files string[]
 ---@field output ?string
 ---@field src_dir ?string
----@field includes ?string[]
+---@field includes ?string[] Private include directories used only when compiling this artifact.
+---@field public_includes ?string[] Include directories exported transitively to dependent artifacts.
+---@field deps ?Binary[] Artifact dependencies declared with Binary handles returned by `build:add_binary`.
 ---@field lib_paths ?string[]
 ---@field libs ?string[]
 ---@field args ?Args
@@ -34,6 +40,7 @@
 
 ---@class Build
 ---@field add_binary fun(self: Build, binary: Graph): Binary
+---@field use_project async fun(self: Build, path: string): Project
 ---@field install async fun(self: Build, join_handle: JoinHandle): string?
 ---@field default_toolchain fun(self: Build): ToolChain
 ---@field default_opt_level fun(self: Build): OptimizationLevel

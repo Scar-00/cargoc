@@ -94,11 +94,17 @@ async fn main() -> Result<ExitCode> {
         })?,
     )?;
 
-    let chunk = lua.load(args.build_scirpt.clone());
-    let out = chunk.eval_async::<LuaFunction>().await?;
-    let build = Build::new(args.clone());
+    let build = Build::new(args.clone())?;
+    let script_path = build.root_script_path()?;
     let build = lua.create_userdata(build)?;
+    lua.globals().set("__cargoc_build", build.clone())?;
+
+    let chunk = lua.load(script_path);
+    let out = chunk.eval_async::<LuaFunction>().await?;
     let res = out.call_async::<()>(&build).await;
+    if let Ok(build_ref) = build.borrow::<Build>() {
+        let _ = build_ref.finish_root_load();
+    }
     //println!("{:#?}", build.borrow::<Build>());
     let exit = match res {
         Ok(_) => ExitCode::SUCCESS,
