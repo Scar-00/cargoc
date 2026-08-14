@@ -1,8 +1,8 @@
-use crate::{CommandExt, database::Entry};
+use crate::{display_path, CommandExt, database::Entry};
 
 use super::graph::{CompilerFlags, ToolChain};
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::process::Command;
 
 #[derive(Debug)]
@@ -55,7 +55,7 @@ impl InputFile {
             args.push(custom.clone());
         });
         self.includes.iter().for_each(|include| {
-            args.push(format!("-I{}", include.display()));
+            args.push(format!("-I{}", display_path(include)));
         });
         Entry {
             directory: dir,
@@ -82,7 +82,7 @@ impl InputFile {
         self.append_args(&mut cmd);
         self.append_includes(&mut cmd);
 
-        tracing::info!("[Compiling]: {}", self.path.display());
+        tracing::info!("[Compiling]: {}", display_path(&self.path));
         tracing::debug!("[Compiling]: Command = {}", cmd.display());
         let out = cmd
             .spawn()
@@ -93,13 +93,13 @@ impl InputFile {
             Ok(out) if !out.success() => {
                 return Err(anyhow::anyhow!(
                     "failed to compile `{}`; compilation aborted",
-                    self.path.display()
+                    display_path(&self.path)
                 ));
             }
             Err(e) => {
                 return Err(anyhow::anyhow!(
                     "failed to compile `{}`; compilation aborted: {}",
-                    self.path.display(),
+                    display_path(&self.path),
                     e
                 ));
             }
@@ -112,12 +112,12 @@ impl InputFile {
     }
 
     fn append_input_file(&self, cmd: &mut Command) {
-        let input = self.path.display().to_string();
+        let input = display_path(&self.path);
         cmd.args([self.tool_chain.compiler_input_flag(), input.as_str()]);
     }
 
     fn append_output_file(&self, cmd: &mut Command) {
-        let output = self.output_path.display().to_string();
+        let output = display_path(&self.output_path);
         if self.tool_chain == ToolChain::Msvc {
             cmd.arg(format!("/Fo{}", output));
             return;
@@ -150,7 +150,7 @@ impl InputFile {
 
     fn append_includes(&self, cmd: &mut Command) {
         self.includes.iter().for_each(|include| {
-            let include = include.display().to_string();
+            let include = display_path(include);
             cmd.args([self.tool_chain.compiler_include_flag(), include.as_str()]);
         });
     }
