@@ -472,6 +472,11 @@ impl Build {
             .lock()
             .map_err(|_| mlua::Error::runtime("build state lock poisoned"))?;
 
+        let project_root = state
+            .project(project_id)
+            .map(|project| project.root_dir.clone())
+            .unwrap_or_default();
+
         let id = state.next_artifact_id;
         state.next_artifact_id += 1;
 
@@ -492,6 +497,7 @@ impl Build {
             excludes: spec.excludes,
             deps: spec.deps,
             full_rebuild: state.args.full_rebuild,
+            project_root,
         };
 
         state.binaries.push(GraphEntry {

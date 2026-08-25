@@ -1,4 +1,4 @@
-use crate::{display_path, CommandExt, database::Entry};
+use crate::{display_path, display_path_relative, CommandExt, database::Entry};
 
 use super::graph::{CompilerFlags, ToolChain};
 use anyhow::{Context, Result};
@@ -18,6 +18,7 @@ pub struct InputFile {
     path: PathBuf,
     pub output_path: PathBuf,
     full_rebuild: bool,
+    project_root: PathBuf,
 }
 
 impl InputFile {
@@ -28,6 +29,7 @@ impl InputFile {
         args: CompilerFlags,
         includes: Vec<PathBuf>,
         full_rebuild: bool,
+        project_root: PathBuf,
     ) -> Self {
         Self {
             tool_chain,
@@ -36,6 +38,7 @@ impl InputFile {
             output_path,
             includes,
             full_rebuild,
+            project_root,
         }
     }
 
@@ -82,7 +85,10 @@ impl InputFile {
         self.append_args(&mut cmd);
         self.append_includes(&mut cmd);
 
-        tracing::info!("[Compiling]: {}", display_path(&self.path));
+        tracing::info!(
+            "[Compiling]: {}",
+            display_path_relative(&self.path, &self.project_root)
+        );
         tracing::debug!("[Compiling]: Command = {}", cmd.display());
         let out = cmd
             .spawn()
@@ -93,13 +99,13 @@ impl InputFile {
             Ok(out) if !out.success() => {
                 return Err(anyhow::anyhow!(
                     "failed to compile `{}`; compilation aborted",
-                    display_path(&self.path)
+                    display_path_relative(&self.path, &self.project_root)
                 ));
             }
             Err(e) => {
                 return Err(anyhow::anyhow!(
                     "failed to compile `{}`; compilation aborted: {}",
-                    display_path(&self.path),
+                    display_path_relative(&self.path, &self.project_root),
                     e
                 ));
             }

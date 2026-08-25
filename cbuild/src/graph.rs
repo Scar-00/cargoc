@@ -14,6 +14,7 @@ use tokio::{
 use crate::{
     database::*,
     display_path,
+    display_path_relative,
     file::{InputFile, OutputFile},
     CommandExt,
 };
@@ -258,6 +259,8 @@ pub struct Graph {
     pub deps: Vec<usize>,
     #[serde(skip)]
     pub full_rebuild: bool,
+    #[serde(skip)]
+    pub project_root: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -446,7 +449,10 @@ impl Graph {
 
     async fn link(&self, files: &[OutputFile], dep_outputs: &[PathBuf]) -> Result<PathBuf> {
         if !self.should_recompile(files, dep_outputs)? {
-            tracing::info!("{} is up to date", display_path(&self.output_path()));
+            tracing::info!(
+                "{} is up to date",
+                display_path_relative(&self.output_path(), &self.project_root)
+            );
             return Ok(self.output_path());
         }
 
@@ -461,20 +467,23 @@ impl Graph {
         self.append_args(&mut cmd);
         self.append_libs(&mut cmd);
 
-        tracing::info!("[Linking]: {}", display_path(&self.output_path()));
+        tracing::info!(
+            "[Linking]: {}",
+            display_path_relative(&self.output_path(), &self.project_root)
+        );
         tracing::debug!("[Linking]: Command = {}", cmd.display());
         let out = cmd.spawn()?.wait().await;
         match out {
             Ok(out) if !out.success() => {
                 return Err(anyhow::anyhow!(
                     "failed to link `{}`; compilation aborted",
-                    display_path(&self.output_path())
+                    display_path_relative(&self.output_path(), &self.project_root)
                 ));
             }
             Err(e) => {
                 return Err(anyhow::anyhow!(
                     "failed to link `{}`; compilation aborted: {}",
-                    display_path(&self.output_path()),
+                    display_path_relative(&self.output_path(), &self.project_root),
                     e
                 ));
             }
@@ -531,6 +540,7 @@ impl Graph {
                     self.args.clone(),
                     includes.clone(),
                     self.full_rebuild,
+                    self.project_root.clone(),
                 )
             })
             .collect())
