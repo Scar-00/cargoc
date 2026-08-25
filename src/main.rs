@@ -1,4 +1,5 @@
 mod build;
+mod init;
 
 use anyhow::Result;
 use build::Build;
@@ -13,7 +14,17 @@ enum Action {
     Build,
     Run,
     GenDatabase,
-    Clean
+    Clean,
+    Init {
+        /// Project name (also used as the new directory name)
+        name: String,
+        /// Create a binary project
+        #[arg(long)]
+        bin: bool,
+        /// Create a library project
+        #[arg(long)]
+        lib: bool,
+    },
 }
 
 impl Action {
@@ -73,6 +84,16 @@ async fn main() -> Result<ExitCode> {
         }))
         .init();
 
+    if let Action::Init { name, bin, lib } = &args.command {
+        return Ok(match init::init_project(name, *bin, *lib) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                tracing::error!("{e:#}");
+                ExitCode::FAILURE
+            }
+        });
+    }
+
     let lua = Lua::new();
 
     lua.globals().set(
@@ -109,9 +130,7 @@ async fn main() -> Result<ExitCode> {
     let exit = match res {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
-            if args.verbose {
-                tracing::error!("{e}");
-            }
+            tracing::error!("{e}");
             ExitCode::FAILURE
         }
     };
