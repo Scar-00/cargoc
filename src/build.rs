@@ -770,7 +770,11 @@ impl LuaUserData for Build {
                 cmd.stderr(Stdio::piped());
                 cmd.args(&args);
                 {
-                    let mut cmdline = format!("\"{}\"", display_path(&binary));
+                    let exe_name = raw_binary
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| display_path(&raw_binary));
+                    let mut cmdline = format!("\"{exe_name}\"");
                     args.iter().for_each(|arg| {
                         cmdline.push_str(&format!(", \"{arg}\""));
                     });
@@ -786,13 +790,17 @@ impl LuaUserData for Build {
                         if let (Some(stdout), Some(stderr)) =
                             (process.stdout.take(), process.stderr.take())
                         {
+                            let exe_name = raw_binary
+                                .file_name()
+                                .map(|name| name.to_string_lossy().to_string())
+                                .unwrap_or_else(|| display_path(&raw_binary));
                             tokio::spawn({
-                                let raw_binary = raw_binary.clone();
+                                let exe_name = exe_name.clone();
                                 async move {
                                     let reader = BufReader::new(stdout);
                                     let mut lines = reader.lines();
                                     while let Ok(Some(line)) = lines.next_line().await {
-                                        let out = format!("[{}]: {}\n", display_path(&raw_binary), line);
+                                        let out = format!("[{exe_name}]: {line}\n");
                                         _ = tokio::io::stdout().write_all(out.as_bytes()).await;
                                     }
                                 }
@@ -801,7 +809,7 @@ impl LuaUserData for Build {
                                 let reader = BufReader::new(stderr);
                                 let mut lines = reader.lines();
                                 while let Ok(Some(line)) = lines.next_line().await {
-                                    let out = format!("[{}]: {}\n", display_path(&raw_binary), line);
+                                    let out = format!("[{exe_name}]: {line}\n");
                                     _ = tokio::io::stderr().write_all(out.as_bytes()).await;
                                 }
                             });
