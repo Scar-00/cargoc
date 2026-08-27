@@ -36,7 +36,7 @@ impl Os {
         } else if cfg!(target_os = "macos") {
             Self::MacOs
         } else {
-            unimplemented!("Os::Current")
+            Self::UnixLike
         }
     }
 }
@@ -89,7 +89,7 @@ impl ToolChain {
         } else if cfg!(target_os = "macos") {
             ToolChain::Clang
         } else {
-            unimplemented!("ToolChain::platform_default()")
+            ToolChain::Gcc
         }
     }
 
@@ -121,20 +121,6 @@ impl ToolChain {
         }
     }
 
-    pub fn compiler_warning_flag(&self) -> &str {
-        match self {
-            Self::Gcc | Self::Clang | Self::Zig | Self::Custom { .. } => "-W",
-            Self::Msvc => "",
-        }
-    }
-
-    pub fn compiler_no_warning_flag(&self) -> &str {
-        match self {
-            Self::Gcc | Self::Clang | Self::Zig | Self::Custom { .. } => "-Wno-",
-            Self::Msvc => "",
-        }
-    }
-
     pub fn compiler(&self) -> &str {
         match self {
             Self::Gcc => "gcc",
@@ -159,8 +145,9 @@ impl ToolChain {
             (Self::Zig, BinaryType::StaticLib) => "ar",
             (Self::Msvc, BinaryType::Executable) => "link.exe",
             (Self::Msvc, BinaryType::StaticLib) => "lib.exe",
+            (Self::Msvc, BinaryType::DynLib) => "link.exe",
+            (Self::Gcc | Self::Clang | Self::Zig, BinaryType::DynLib) => self.compiler(),
             (Self::Custom { linker, .. }, _) => linker,
-            (chain, typ) => unimplemented!("linker: {chain:?}, {typ:?}"),
         }
     }
 
@@ -174,14 +161,14 @@ impl ToolChain {
     pub fn linker_link_lib(&self) -> &str {
         match self {
             Self::Gcc | Self::Clang | Self::Zig | Self::Custom { .. } => "-l",
-            Self::Msvc => unimplemented!("msvc: linker_link_lib()"),
+            Self::Msvc => "",
         }
     }
 
     pub fn linker_link_dir_flag(&self) -> &str {
         match self {
             Self::Gcc | Self::Clang | Self::Zig | Self::Custom { .. } => "-L",
-            Self::Msvc => unimplemented!("msvc: linker_link_dir_flag()"),
+            Self::Msvc => "/LIBPATH:",
         }
     }
 }
@@ -196,15 +183,39 @@ pub enum WarningFlag {
 }
 
 impl WarningFlag {
-    pub fn to_string(&self, tool_chain: &ToolChain) -> &str {
-        use ToolChain::Msvc;
-        match (self, tool_chain) {
-            (_, Msvc) => "",
-            (Self::Error, _) => "error",
-            (Self::Pedantic, _) => "pedantic",
-            (Self::Extra, _) => "extra",
-            (Self::All, _) => "all",
-            (Self::DeprecatedDeclarations, _) => "deprecated-declarations",
+    pub fn to_string(&self, tool_chain: &ToolChain) -> String {
+        match tool_chain {
+            ToolChain::Msvc => match self {
+                Self::Error => "/WX".to_string(),
+                Self::Pedantic => "/W4".to_string(),
+                Self::Extra => "/W4".to_string(),
+                Self::All => "/W3".to_string(),
+                Self::DeprecatedDeclarations => "/wd4996".to_string(),
+            },
+            _ => {
+                let suffix = match self {
+                    Self::Error => "error",
+                    Self::Pedantic => "pedantic",
+                    Self::Extra => "extra",
+                    Self::All => "all",
+                    Self::DeprecatedDeclarations => "deprecated-declarations",
+                };
+                format!("-W{suffix}")
+            }
+        }
+    }
+
+    pub fn warning_flag(&self, tool_chain: &ToolChain) -> String {
+        match tool_chain {
+            ToolChain::Msvc => self.to_string(tool_chain),
+            _ => format!("-W{}", self.to_string(tool_chain)),
+        }
+    }
+
+    pub fn no_warning_flag(&self, tool_chain: &ToolChain) -> String {
+        match tool_chain {
+            ToolChain::Msvc => self.to_string(tool_chain),
+            _ => format!("-Wno-{}", self.to_string(tool_chain)),
         }
     }
 }
@@ -603,8 +614,12 @@ impl Graph {
             return;
         }
 
-        self.libs.iter().for_each(|path| {
-            cmd.arg(format!("{}{}", self.tool_chain.linker_link_lib(), path));
+        self.libs.iter().for_each(|lib| {
+            if self.tool_chain == ToolChain::Msvc {
+                cmd.arg(format!("{lib}.lib"));
+            } else {
+                cmd.arg(format!("{}{}", self.tool_chain.linker_link_lib(), lib));
+            }
         });
         self.lib_paths.iter().for_each(|path| {
             cmd.arg(format!("{}{}", self.tool_chain.linker_link_dir_flag(), path));
@@ -709,6 +724,7 @@ mod tests {
             excludes: None,
             deps,
             full_rebuild: false,
+            project_root: PathBuf::new(),
         }
     }
 

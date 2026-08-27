@@ -49,10 +49,10 @@ impl InputFile {
             + self.includes.len();
         let mut args = Vec::with_capacity(len);
         self.args.warnings.iter().for_each(|warning| {
-            args.push(format!("-W{}", warning.to_string(&ToolChain::Clang)));
+            args.push(warning.warning_flag(&self.tool_chain));
         });
         self.args.no_warnings.iter().for_each(|warning| {
-            args.push(format!("-Wno-{}", warning.to_string(&ToolChain::Clang)));
+            args.push(warning.no_warning_flag(&self.tool_chain));
         });
         self.args.custom.iter().for_each(|custom| {
             args.push(custom.clone());
@@ -136,18 +136,10 @@ impl InputFile {
             cmd.arg("/nologo");
         }
         self.args.warnings.iter().for_each(|warning| {
-            cmd.arg(format!(
-                "{}{}",
-                self.tool_chain.compiler_warning_flag(),
-                warning.to_string(&self.tool_chain),
-            ));
+            cmd.arg(warning.warning_flag(&self.tool_chain));
         });
         self.args.no_warnings.iter().for_each(|warning| {
-            cmd.arg(format!(
-                "{}{}",
-                self.tool_chain.compiler_no_warning_flag(),
-                warning.to_string(&self.tool_chain),
-            ));
+            cmd.arg(warning.no_warning_flag(&self.tool_chain));
         });
         self.args.custom.iter().for_each(|flag| {
             cmd.arg(flag);
