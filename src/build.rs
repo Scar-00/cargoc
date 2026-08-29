@@ -1,24 +1,25 @@
-use cbuild::graph::{BuildRegistry, OptimizationLevel, Os};
-use cbuild::{graph::ToolChain, *};
+use cbuild::{
+    display_path,
+    graph::{self, BuildRegistry, OptimizationLevel, Os, ToolChain},
+};
 use mlua::prelude::*;
 use path_absolutize::Absolutize;
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
+    collections::HashMap, panic::UnwindSafe, path::{Path, PathBuf}, sync::{
         Arc, Mutex,
-    },
+        atomic::{AtomicUsize, Ordering},
+    }
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::{process::Command, task::JoinHandle};
 
 static NEXT_SESSION_ID: AtomicUsize = AtomicUsize::new(1);
-const BUILD_GLOBAL_KEY: &str = "__cargoc_build";
+const BUILD_GLOBAL_KEY: &str = "build";
 
-fn display_path(path: &Path) -> String {
-    path.display().to_string().replace("\\\\?\\", "")
+pub(crate) async fn load_script(lua: &Lua, path: &Path) -> LuaResult<LuaFunction> {
+    let source = tokio::fs::read(path).await.map_err(mlua::Error::external)?;
+    lua.load(&source).eval_async().await
 }
 
 #[derive(Debug, Clone)]
@@ -34,8 +35,8 @@ impl LuaUserData for BuildArtifact {
 }
 
 pub enum TargetHandle {
-    InProgress(JoinHandle<Option<BuildArtifact>>),
-    Done(Option<BuildArtifact>),
+    InProgress(JoinHandle<LuaResult<BuildArtifact>>),
+    Done(BuildArtifact),
 }
 
 impl LuaUserData for TargetHandle {}
@@ -140,38 +141,42 @@ impl GraphHandle {
             .lock()
             .map_err(|_| mlua::Error::runtime("build state lock poisoned"))?;
         if state.session_id != self.session_id {
-            return Err(mlua::Error::runtime("binary handle belongs to a different build session"));
+            return Err(mlua::Error::runtime(
+                "binary handle belongs to a different build session",
+            ));
         }
 
         let registry = state.registry();
-        let graph = state
-            .graph(self.id)
-            .cloned()
-            .ok_or_else(|| mlua::Error::runtime(format!("unknown binary handle id `{}`", self.id)))?;
+        let graph = state.graph(self.id).cloned().ok_or_else(|| {
+            mlua::Error::runtime(format!("unknown binary handle id `{}`", self.id))
+        })?;
 
         Ok((state.args.clone(), registry, graph.inner))
     }
 
-    async fn build_artifact(&self) -> LuaResult<Option<BuildArtifact>> {
+    async fn build_artifact(&self) -> LuaResult<BuildArtifact> {
         let (args, registry, graph) = self.snapshot()?;
 
         if args.command.parse_only() {
-            return Ok(Some(BuildArtifact {
+            return Ok(BuildArtifact {
                 name: graph.name.clone(),
                 path: None,
-            }));
+            });
         }
 
         let order = registry.dependency_order(graph.id).into_lua_err()?;
         for artifact_id in order {
             let artifact = registry.require(artifact_id).into_lua_err()?;
-            artifact.build_with_registry(&registry).await.into_lua_err()?;
+            artifact
+                .build_with_registry(&registry)
+                .await
+                .into_lua_err()?;
         }
 
-        Ok(Some(BuildArtifact {
+        Ok(BuildArtifact {
             name: graph.name.clone(),
             path: Some(graph.output_path()),
-        }))
+        })
     }
 }
 
@@ -180,14 +185,11 @@ impl LuaUserData for GraphHandle {
         methods.add_method("build", |_, this, _: ()| {
             let handle = this.clone();
             Ok(TargetHandle::InProgress(tokio::spawn(async move {
-                handle.build_artifact().await.ok().flatten()
+                handle.build_artifact().await
             })))
         });
         methods.add_async_method("build_and_install", async |_, this, _: ()| {
-            let Some(artifact) = this.build_artifact().await? else {
-                return Err(mlua::Error::runtime("build did not produce an artifact"));
-            };
-            Ok(artifact)
+            this.build_artifact().await
         });
         methods.add_method_mut("export", |_, this, name: Option<String>| {
             let mut state = this
@@ -195,15 +197,20 @@ impl LuaUserData for GraphHandle {
                 .lock()
                 .map_err(|_| mlua::Error::runtime("build state lock poisoned"))?;
             if state.session_id != this.session_id {
-                return Err(mlua::Error::runtime("binary handle belongs to a different build session"));
+                return Err(mlua::Error::runtime(
+                    "binary handle belongs to a different build session",
+                ));
             }
 
             let graph_index = state
                 .binaries
                 .iter()
                 .position(|graph| graph.id == this.id)
-                .ok_or_else(|| mlua::Error::runtime(format!("unknown binary handle id `{}`", this.id)))?;
-            let export_name = name.unwrap_or_else(|| state.binaries[graph_index].inner.name.clone());
+                .ok_or_else(|| {
+                    mlua::Error::runtime(format!("unknown binary handle id `{}`", this.id))
+                })?;
+            let export_name =
+                name.unwrap_or_else(|| state.binaries[graph_index].inner.name.clone());
             let project_id = state.binaries[graph_index].project_id;
             let project_index = state
                 .projects
@@ -233,8 +240,7 @@ impl LuaUserData for GraphHandle {
                 if existing != &export_name {
                     return Err(mlua::Error::runtime(format!(
                         "artifact `{}` already exported as `{}`",
-                        state.binaries[graph_index].inner.name,
-                        existing
+                        state.binaries[graph_index].inner.name, existing
                     )));
                 }
             } else {
@@ -254,12 +260,14 @@ impl LuaUserData for ProjectHandle {
                 .lock()
                 .map_err(|_| mlua::Error::runtime("build state lock poisoned"))?;
             if state.session_id != this.session_id {
-                return Err(mlua::Error::runtime("project handle belongs to a different build session"));
+                return Err(mlua::Error::runtime(
+                    "project handle belongs to a different build session",
+                ));
             }
 
-            let project = state
-                .project(this.project_id)
-                .ok_or_else(|| mlua::Error::runtime(format!("unknown project id `{}`", this.project_id)))?;
+            let project = state.project(this.project_id).ok_or_else(|| {
+                mlua::Error::runtime(format!("unknown project id `{}`", this.project_id))
+            })?;
             let Some(artifact_id) = project.export_names.get(&name).copied() else {
                 return Err(mlua::Error::runtime(format!(
                     "project `{}` does not export artifact `{}`",
@@ -279,7 +287,7 @@ impl LuaUserData for ProjectHandle {
 
 impl Build {
     pub fn new(args: crate::Cli) -> anyhow::Result<Self> {
-        let build_script = Self::normalize_script_path(&args.build_scirpt)?;
+        let build_script = Self::normalize_script_path(&args.build_script)?;
         let root_dir = build_script
             .parent()
             .map(Path::to_path_buf)
@@ -331,6 +339,14 @@ impl Build {
         Ok(())
     }
 
+    fn unused_cli_args(&self) -> LuaResult<Vec<String>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| mlua::Error::runtime("build state lock poisoned"))?;
+        Ok(state.args.command.unused_cli_args().to_vec())
+    }
+
     fn normalize_script_path(path: &Path) -> anyhow::Result<PathBuf> {
         let path = if path.is_absolute() {
             path.to_path_buf()
@@ -342,27 +358,34 @@ impl Build {
             .or_else(|_| path.absolutize().map(|p| p.to_path_buf()))?)
     }
 
-    fn resolve_existing_project_dir(base_dir: &Path, path: &str) -> LuaResult<PathBuf> {
+    async fn resolve_existing_project_dir(base_dir: &Path, path: &str) -> LuaResult<PathBuf> {
         let candidate = PathBuf::from(path);
         let candidate = if candidate.is_absolute() {
             candidate
         } else {
             base_dir.join(candidate)
         };
-        if !candidate.exists() {
+        if !tokio::fs::try_exists(&candidate)
+            .await
+            .map_err(mlua::Error::external)?
+        {
             return Err(mlua::Error::runtime(format!(
                 "imported project path does not exist: {}",
                 display_path(&candidate)
             )));
         }
-        if !candidate.is_dir() {
+        if !tokio::fs::metadata(&candidate)
+            .await
+            .map_err(mlua::Error::external)?
+            .is_dir()
+        {
             return Err(mlua::Error::runtime(format!(
                 "imported project path is not a directory: {}",
                 display_path(&candidate)
             )));
         }
-        candidate
-            .canonicalize()
+        tokio::fs::canonicalize(&candidate)
+            .await
             .or_else(|_| candidate.absolutize().map(|p| p.to_path_buf()))
             .map_err(mlua::Error::external)
     }
@@ -388,7 +411,9 @@ impl Build {
     {
         let value: LuaValue = table.get(key)?;
         if matches!(value, LuaValue::Nil) {
-            return Err(mlua::Error::runtime(format!("missing required field `{key}`")));
+            return Err(mlua::Error::runtime(format!(
+                "missing required field `{key}`"
+            )));
         }
         lua.from_value(value)
     }
@@ -411,7 +436,9 @@ impl Build {
             return if matches!(deps, LuaValue::Nil) {
                 Ok(Vec::new())
             } else {
-                Err(mlua::Error::runtime("`deps` must be an array of Binary handles"))
+                Err(mlua::Error::runtime(
+                    "`deps` must be an array of Binary handles",
+                ))
             };
         };
 
@@ -440,11 +467,10 @@ impl Build {
         let src_dir = Self::parse_optional::<PathBuf>(lua, &table, "src_dir")?
             .unwrap_or_else(|| PathBuf::from("src"));
         let files = Self::parse_required::<Vec<PathBuf>>(lua, &table, "files")?;
-        let includes = Self::parse_optional::<Vec<PathBuf>>(lua, &table, "includes")?
+        let includes =
+            Self::parse_optional::<Vec<PathBuf>>(lua, &table, "includes")?.unwrap_or_default();
+        let public_includes = Self::parse_optional::<Vec<PathBuf>>(lua, &table, "public_includes")?
             .unwrap_or_default();
-        let public_includes =
-            Self::parse_optional::<Vec<PathBuf>>(lua, &table, "public_includes")?
-                .unwrap_or_default();
         let excludes = Self::parse_optional::<Vec<PathBuf>>(lua, &table, "excludes")?;
 
         Ok(GraphSpec {
@@ -539,7 +565,11 @@ impl Build {
             .lock()
             .map_err(|_| mlua::Error::runtime("build state lock poisoned"))?;
 
-        if let Some(position) = state.loading_projects.iter().position(|path| path == &root_dir) {
+        if let Some(position) = state
+            .loading_projects
+            .iter()
+            .position(|path| path == &root_dir)
+        {
             let cycle = state.loading_projects[position..]
                 .iter()
                 .chain(std::iter::once(&root_dir))
@@ -551,7 +581,11 @@ impl Build {
             )));
         }
 
-        if let Some(project) = state.projects.iter().find(|project| project.root_dir == root_dir) {
+        if let Some(project) = state
+            .projects
+            .iter()
+            .find(|project| project.root_dir == root_dir)
+        {
             return Ok(Ok(ProjectHandle {
                 project_id: project.id,
                 session_id: state.session_id,
@@ -587,7 +621,9 @@ impl Build {
             .lock()
             .map_err(|_| mlua::Error::runtime("build state lock poisoned"))?;
         state.current_project_stack.pop();
-        state.loading_projects.retain(|path| path != &pending.root_dir);
+        state
+            .loading_projects
+            .retain(|path| path != &pending.root_dir);
 
         Ok(ProjectHandle {
             project_id: pending.project_id,
@@ -602,24 +638,28 @@ impl Build {
             .lock()
             .map_err(|_| mlua::Error::runtime("build state lock poisoned"))?;
         state.current_project_stack.pop();
-        state.loading_projects.retain(|path| path != &pending.root_dir);
+        state
+            .loading_projects
+            .retain(|path| path != &pending.root_dir);
         state.binaries.truncate(pending.binary_len_before);
         state.projects.truncate(pending.project_len_before);
         Ok(())
     }
 
     async fn evaluate_project_script(&self, lua: &Lua, script_path: &Path) -> LuaResult<()> {
-        let chunk = lua.load(script_path);
-        let out = chunk.eval_async::<LuaFunction>().await?;
+        let out = load_script(lua, script_path).await?;
         let build_ud: LuaAnyUserData = lua.globals().get(BUILD_GLOBAL_KEY)?;
         out.call_async::<()>(build_ud).await
     }
 
     async fn use_project_inner(&self, lua: &Lua, path: String) -> LuaResult<ProjectHandle> {
         let (_, _, current_root) = self.current_project_context()?;
-        let root_dir = Self::resolve_existing_project_dir(&current_root, &path)?;
+        let root_dir = Self::resolve_existing_project_dir(&current_root, &path).await?;
         let script_path = root_dir.join("build.lua");
-        if !script_path.exists() {
+        if !tokio::fs::try_exists(&script_path)
+            .await
+            .map_err(mlua::Error::external)?
+        {
             return Err(mlua::Error::runtime(format!(
                 "imported project build script does not exist: {}",
                 display_path(&script_path)
@@ -629,7 +669,9 @@ impl Build {
         match self.begin_project_load(root_dir, script_path.clone())? {
             Ok(existing) => Ok(existing),
             Err(pending) => {
-                let result = self.evaluate_project_script(lua, &pending.script_path).await;
+                let result = self
+                    .evaluate_project_script(lua, &pending.script_path)
+                    .await;
                 match result {
                     Ok(()) => self.finish_project_load(&pending),
                     Err(error) => {
@@ -645,7 +687,7 @@ impl Build {
         }
     }
 
-    pub async fn generate_database(
+    async fn generate_database(
         _: Lua,
         this: LuaUserDataRef<Self>,
         path: Option<PathBuf>,
@@ -692,6 +734,12 @@ impl Build {
     }
 }
 
+#[derive(Default, Serialize, Deserialize)]
+struct RunOptions {
+    silent: Option<bool>,
+    args: Option<Vec<String>>
+}
+
 impl LuaUserData for Build {
     fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
         methods.add_method_mut("add_binary", |lua, this, args: LuaValue| {
@@ -715,7 +763,7 @@ impl LuaUserData for Build {
             async |_, _, mut arg: LuaUserDataRefMut<TargetHandle>| {
                 let artifact = match &mut *arg {
                     TargetHandle::InProgress(handle) => {
-                        let artifact = handle.await.into_lua_err()?;
+                        let artifact = handle.await.into_lua_err()??;
                         *arg = TargetHandle::Done(artifact.clone());
                         artifact
                     }
@@ -742,24 +790,25 @@ impl LuaUserData for Build {
             lua.to_value(&opt_lvl)
         });
         methods.add_method("host_os", |lua, _, _: ()| lua.to_value(&Os::current()));
+        methods.add_method("unused_cli_args", |_, this, _: ()| this.unused_cli_args());
         methods.add_method("wants_run", |_, this, _: ()| {
-            Ok(
-                this.state
-                    .lock()
-                    .map_err(|_| mlua::Error::runtime("build state lock poisoned"))?
-                    .args
-                    .command
-                    == crate::Action::Run,
-            )
+            let state = this
+                .state
+                .lock()
+                .map_err(|_| mlua::Error::runtime("build state lock poisoned"))?;
+            Ok(matches!(&state.args.command, crate::Action::Run(_)))
         });
         methods.add_async_method(
             "run",
-            async |_, _, (binary, args): (LuaUserDataRef<BuildArtifact>, Option<Vec<String>>)| {
+            async |lua, _, (binary, args): (LuaUserDataRef<BuildArtifact>, LuaValue)| {
                 use std::process::Stdio;
                 let Some(binary) = binary.path.clone() else {
                     return Ok(None);
                 };
+                let args = lua.from_value::<Option<RunOptions>>(args)?;
+                let RunOptions { silent, args } = args.unwrap_or_default();
                 let args = args.unwrap_or_default();
+                let silent = silent.unwrap_or_default();
                 let raw_binary = binary.clone();
                 let binary = binary
                     .absolutize()
@@ -775,9 +824,9 @@ impl LuaUserData for Build {
                         .map(|name| name.to_string_lossy().to_string())
                         .unwrap_or_else(|| display_path(&raw_binary));
                     let mut cmdline = format!("\"{exe_name}\"");
-                    args.iter().for_each(|arg| {
+                    for arg in &args {
                         cmdline.push_str(&format!(", \"{arg}\""));
-                    });
+                    }
                     tracing::info!("Running: {}", cmdline);
                 }
                 let process = cmd.spawn();
@@ -790,29 +839,31 @@ impl LuaUserData for Build {
                         if let (Some(stdout), Some(stderr)) =
                             (process.stdout.take(), process.stderr.take())
                         {
-                            let exe_name = raw_binary
-                                .file_name()
-                                .map(|name| name.to_string_lossy().to_string())
-                                .unwrap_or_else(|| display_path(&raw_binary));
-                            tokio::spawn({
-                                let exe_name = exe_name.clone();
-                                async move {
-                                    let reader = BufReader::new(stdout);
+                            if !silent {
+                                let exe_name = raw_binary
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| display_path(&raw_binary));
+                                tokio::spawn({
+                                    let exe_name = exe_name.clone();
+                                    async move {
+                                        let reader = BufReader::new(stdout);
+                                        let mut lines = reader.lines();
+                                        while let Ok(Some(line)) = lines.next_line().await {
+                                            let out = format!("[{exe_name}]: {line}\n");
+                                            _ = tokio::io::stdout().write_all(out.as_bytes()).await;
+                                        }
+                                    }
+                                });
+                                tokio::spawn(async move {
+                                    let reader = BufReader::new(stderr);
                                     let mut lines = reader.lines();
                                     while let Ok(Some(line)) = lines.next_line().await {
                                         let out = format!("[{exe_name}]: {line}\n");
-                                        _ = tokio::io::stdout().write_all(out.as_bytes()).await;
+                                        _ = tokio::io::stderr().write_all(out.as_bytes()).await;
                                     }
-                                }
-                            });
-                            tokio::spawn(async move {
-                                let reader = BufReader::new(stderr);
-                                let mut lines = reader.lines();
-                                while let Ok(Some(line)) = lines.next_line().await {
-                                    let out = format!("[{exe_name}]: {line}\n");
-                                    _ = tokio::io::stderr().write_all(out.as_bytes()).await;
-                                }
-                            });
+                                });
+                            }
                         }
                         if let Ok(status) = process.wait().await {
                             Some(status.success())
@@ -824,16 +875,34 @@ impl LuaUserData for Build {
             },
         );
         methods.add_method("should_generate_database", |_, this, _: ()| {
-            Ok(
-                this.state
-                    .lock()
-                    .map_err(|_| mlua::Error::runtime("build state lock poisoned"))?
-                    .args
-                    .command
-                    == crate::Action::GenDatabase,
-            )
+            let state = this
+                .state
+                .lock()
+                .map_err(|_| mlua::Error::runtime("build state lock poisoned"))?;
+            Ok(matches!(&state.args.command, crate::Action::GenDatabase(_)))
         });
         methods.add_async_method("generate_database", Self::generate_database);
+        methods.add_async_method(
+            "read_dir",
+            |_, _, (path, ext): (PathBuf, Option<String>)| async move {
+                let mut directory = tokio::fs::read_dir(path).await?;
+                let mut files = Vec::new();
+                while let Some(entry) = directory.next_entry().await? {
+                    let file_name = entry.file_name().to_string_lossy().into_owned();
+                    let matches_extension = ext.as_deref().is_none_or(|extension| {
+                        Path::new(&file_name)
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                            == Some(extension)
+                    });
+                    if matches_extension {
+                        files.push(file_name);
+                    }
+                }
+                files.sort_unstable();
+                Ok(files)
+            },
+        );
     }
 }
 
@@ -861,8 +930,8 @@ mod tests {
 
     fn make_cli(build_script: PathBuf) -> crate::Cli {
         crate::Cli {
-            build_scirpt: build_script,
-            command: crate::Action::Build,
+            build_script,
+            command: crate::Action::Build(Default::default()),
             full_rebuild: false,
             release: false,
             verbose: false,
@@ -875,8 +944,7 @@ mod tests {
         let script_path = build.root_script_path()?;
         let userdata = lua.create_userdata(build)?;
         lua.globals().set(BUILD_GLOBAL_KEY, userdata.clone())?;
-        let chunk = lua.load(script_path);
-        let out = chunk.eval_async::<LuaFunction>().await?;
+        let out = load_script(&lua, &script_path).await?;
         out.call_async::<()>(userdata.clone()).await?;
         let build = userdata.take::<Build>()?;
         build.finish_root_load()?;
@@ -935,7 +1003,11 @@ end
         let state = build.state.lock().unwrap();
         assert_eq!(state.projects.len(), 2);
         assert_eq!(state.binaries.len(), 2);
-        let app = state.binaries.iter().find(|graph| graph.inner.name == "app").unwrap();
+        let app = state
+            .binaries
+            .iter()
+            .find(|graph| graph.inner.name == "app")
+            .unwrap();
         assert_eq!(app.inner.deps.len(), 1);
     }
 
@@ -972,7 +1044,10 @@ end
         )
         .unwrap();
 
-        let err = run_build_script(root.join("build.lua")).await.unwrap_err().to_string();
+        let err = run_build_script(root.join("build.lua"))
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("does not export artifact `core`"));
     }
 
@@ -994,7 +1069,10 @@ end
         )
         .unwrap();
 
-        let err = run_build_script(a.join("build.lua")).await.unwrap_err().to_string();
+        let err = run_build_script(a.join("build.lua"))
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("project import cycle detected"));
     }
 
@@ -1031,15 +1109,55 @@ end
 
         let build = run_build_script(root.join("build.lua")).await.unwrap();
         let state = build.state.lock().unwrap();
-        let core = state.binaries.iter().find(|graph| graph.inner.name == "core").unwrap();
+        let core = state
+            .binaries
+            .iter()
+            .find(|graph| graph.inner.name == "core")
+            .unwrap();
         let expected_file = dep.join("src").join("core.c");
         let expected_include = dep.join("include");
         let expected_output = dep.join("core");
-        assert_eq!(normalize_path(&core.inner.files[0]), normalize_path(&expected_file));
+        assert_eq!(
+            normalize_path(&core.inner.files[0]),
+            normalize_path(&expected_file)
+        );
         assert_eq!(
             normalize_path(&core.inner.public_includes[0]),
             normalize_path(&expected_include)
         );
-        assert_eq!(normalize_path(&core.inner.output), normalize_path(&expected_output));
+        assert_eq!(
+            normalize_path(&core.inner.output),
+            normalize_path(&expected_output)
+        );
+    }
+
+    #[tokio::test]
+    async fn read_dir_is_async_and_filters_extensions() {
+        let root = temp_dir("read-dir");
+        fs::write(root.join("z.c"), "").unwrap();
+        fs::write(root.join("a.c"), "").unwrap();
+        fs::write(root.join("notes.txt"), "").unwrap();
+
+        let lua = Lua::new();
+        let build = Build::new(make_cli(root.join("build.lua"))).unwrap();
+        let build = lua.create_userdata(build).unwrap();
+        lua.globals().set("build", build).unwrap();
+        lua.globals()
+            .set("path", root.to_string_lossy().into_owned())
+            .unwrap();
+
+        let c_files: Vec<String> = lua
+            .load("return build:read_dir(path, 'c')")
+            .eval_async()
+            .await
+            .unwrap();
+        let all_files: Vec<String> = lua
+            .load("return build:read_dir(path)")
+            .eval_async()
+            .await
+            .unwrap();
+
+        assert_eq!(c_files, ["a.c", "z.c"]);
+        assert_eq!(all_files, ["a.c", "notes.txt", "z.c"]);
     }
 }

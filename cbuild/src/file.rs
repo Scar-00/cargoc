@@ -1,4 +1,4 @@
-use crate::{display_path, display_path_relative, CommandExt, database::Entry};
+use crate::{CommandExt, database::Entry, display_path, display_path_relative};
 
 use super::graph::{CompilerFlags, ToolChain};
 use anyhow::{Context, Result};
@@ -42,24 +42,28 @@ impl InputFile {
         }
     }
 
-    pub fn database_entry<'a>(&'a self, dir: PathBuf) -> Entry {
+    pub fn database_entry(&self, dir: PathBuf) -> Entry {
         let len = self.args.warnings.len()
             + self.args.no_warnings.len()
             + self.args.custom.len()
             + self.includes.len();
         let mut args = Vec::with_capacity(len);
-        self.args.warnings.iter().for_each(|warning| {
+        for warning in &self.args.warnings {
             args.push(warning.warning_flag(&self.tool_chain));
-        });
-        self.args.no_warnings.iter().for_each(|warning| {
+        }
+        for warning in &self.args.no_warnings {
             args.push(warning.no_warning_flag(&self.tool_chain));
-        });
-        self.args.custom.iter().for_each(|custom| {
+        }
+        for custom in &self.args.custom {
             args.push(custom.clone());
-        });
-        self.includes.iter().for_each(|include| {
-            args.push(format!("-I{}", display_path(include)));
-        });
+        }
+        for include in &self.includes {
+            args.push(format!(
+                "{}{}",
+                self.tool_chain.compiler_include_flag(),
+                display_path(include)
+            ));
+        }
         Entry {
             directory: dir,
             file: self.path.clone(),
@@ -69,7 +73,7 @@ impl InputFile {
     }
 
     pub async fn compile(&self) -> Result<OutputFile> {
-        if !self.should_recompile()? {
+        if !self.should_recompile().await? {
             return Ok(OutputFile {
                 path: self.output_path.clone(),
             });
@@ -135,30 +139,30 @@ impl InputFile {
         if self.tool_chain == ToolChain::Msvc {
             cmd.arg("/nologo");
         }
-        self.args.warnings.iter().for_each(|warning| {
+        for warning in &self.args.warnings {
             cmd.arg(warning.warning_flag(&self.tool_chain));
-        });
-        self.args.no_warnings.iter().for_each(|warning| {
+        }
+        for warning in &self.args.no_warnings {
             cmd.arg(warning.no_warning_flag(&self.tool_chain));
-        });
-        self.args.custom.iter().for_each(|flag| {
+        }
+        for flag in &self.args.custom {
             cmd.arg(flag);
-        });
+        }
     }
 
     fn append_includes(&self, cmd: &mut Command) {
-        self.includes.iter().for_each(|include| {
+        for include in &self.includes {
             let include = display_path(include);
             cmd.args([self.tool_chain.compiler_include_flag(), include.as_str()]);
-        });
+        }
     }
 
-    fn should_recompile(&self) -> Result<bool> {
+    async fn should_recompile(&self) -> Result<bool> {
         if self.full_rebuild {
             return Ok(true);
         }
-        let input_metadata = self.path.metadata()?;
-        let Ok(output_metadata) = self.output_path.metadata() else {
+        let input_metadata = tokio::fs::metadata(&self.path).await?;
+        let Ok(output_metadata) = tokio::fs::metadata(&self.output_path).await else {
             return Ok(true);
         };
         Ok(input_metadata.modified()? > output_metadata.modified()?)

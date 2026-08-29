@@ -10,12 +10,17 @@
 ---@field no_warnings ?ErrorFlag[]
 ---@field custom ?string[]
 
+---@class RunOptions
+---@field silent ?boolean
+---@field args ?string[]
+
 ---@class JoinHandle
 
 ---@class BuildArtifact
+---@field name fun(self: BuildArtifact): string
 
 ---@class Binary
----@field build async fun(self: Binary): JoinHandle
+---@field build fun(self: Binary): JoinHandle
 ---@field build_and_install async fun(self: Binary): BuildArtifact
 ---@field export fun(self: Binary, name: string?): Binary
 
@@ -41,11 +46,13 @@
 ---@class Build
 ---@field add_binary fun(self: Build, binary: Graph): Binary
 ---@field use_project async fun(self: Build, path: string): Project
----@field install async fun(self: Build, join_handle: JoinHandle): string?
+---@field install async fun(self: Build, join_handle: JoinHandle): BuildArtifact
 ---@field default_toolchain fun(self: Build): ToolChain
 ---@field default_opt_level fun(self: Build): OptimizationLevel
 ---@field wants_run fun(self: Build): boolean
----@field run async fun(self: Build, binary: BuildArtifact, args: string[]?): boolean
+---@field run async fun(self: Build, binary: BuildArtifact, opt: RunOptions?): boolean?
 ---@field host_os fun(self: Build): Os
 ---@field should_generate_database fun(self: Build): boolean
----@field generate_database fun(self: Build, path: string?): boolean
+---@field generate_database async fun(self: Build, path: string?): boolean
+---@field read_dir async fun(self: Build, path: string, ext: string?): string[]
+---@field unused_cli_args fun(self: Build): string[]

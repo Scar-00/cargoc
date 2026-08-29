@@ -24,11 +24,6 @@ return function (build)
     local warnings = {{ "Error", "Pedantic", "All", "Extra" }};
     local no_warnings = {{ "DeprecatedDeclarations" }};
 
-    if tool_chain == "Msvc" then
-        warnings = {{}};
-        no_warnings = {{}};
-    end
-
     local main = build:add_binary({{
         name = "{name}",
         tool_chain = tool_chain,
@@ -152,18 +147,20 @@ pub fn init_project(name: &str, bin: bool, lib: bool) -> Result<()> {
     for (relative, contents) in &template.files {
         let path = project_path.join(relative);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create directory `{}`", parent.display())
-            })?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory `{}`", parent.display()))?;
         }
         write_file(&path, contents)?;
     }
 
-    tracing::info!("created {} project `{}`", if lib && !bin { "library" } else { "binary" }, project_name);
+    tracing::info!(
+        "created {} project `{}`",
+        if lib && !bin { "library" } else { "binary" },
+        project_name
+    );
     Ok(())
 }
 
 fn write_file(path: &Path, contents: &str) -> Result<()> {
-    std::fs::write(path, contents)
-        .with_context(|| format!("failed to write `{}`", path.display()))
+    std::fs::write(path, contents).with_context(|| format!("failed to write `{}`", path.display()))
 }

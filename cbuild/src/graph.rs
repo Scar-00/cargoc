@@ -12,16 +12,15 @@ use tokio::{
 };
 
 use crate::{
-    database::*,
-    display_path,
-    display_path_relative,
-    file::{InputFile, OutputFile},
     CommandExt,
+    database::Database,
+    display_path, display_path_relative,
+    file::{InputFile, OutputFile},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Os {
-    Window,
+    Windows,
     Linux,
     MacOs,
     UnixLike,
@@ -30,7 +29,7 @@ pub enum Os {
 impl Os {
     pub fn current() -> Self {
         if cfg!(target_os = "windows") {
-            Self::Window
+            Self::Windows
         } else if cfg!(target_os = "linux") {
             Self::Linux
         } else if cfg!(target_os = "macos") {
@@ -54,7 +53,7 @@ pub enum OptimizationLevel {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Target {
-    WindowX86,
+    WindowsX86,
     WindowsX64,
     LinuxX86,
     LinuxX64,
@@ -82,14 +81,11 @@ pub enum ToolChain {
 
 impl ToolChain {
     pub fn platform_default() -> Self {
-        if cfg!(target_os = "windows") {
-            ToolChain::Msvc
-        } else if cfg!(target_os = "linux") {
-            ToolChain::Gcc
-        } else if cfg!(target_os = "macos") {
-            ToolChain::Clang
-        } else {
-            ToolChain::Gcc
+        match Os::current() {
+            Os::Windows => Self::Msvc,
+            Os::Linux => Self::Gcc,
+            Os::MacOs => Self::Clang,
+            Os::UnixLike => Self::Gcc,
         }
     }
 
@@ -183,50 +179,48 @@ pub enum WarningFlag {
 }
 
 impl WarningFlag {
-    pub fn to_string(&self, tool_chain: &ToolChain) -> String {
-        match tool_chain {
-            ToolChain::Msvc => match self {
-                Self::Error => "/WX".to_string(),
-                Self::Pedantic => "/W4".to_string(),
-                Self::Extra => "/W4".to_string(),
-                Self::All => "/W3".to_string(),
-                Self::DeprecatedDeclarations => "/wd4996".to_string(),
-            },
-            _ => {
-                let suffix = match self {
-                    Self::Error => "error",
-                    Self::Pedantic => "pedantic",
-                    Self::Extra => "extra",
-                    Self::All => "all",
-                    Self::DeprecatedDeclarations => "deprecated-declarations",
-                };
-                format!("-W{suffix}")
-            }
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Pedantic => "pedantic",
+            Self::Extra => "extra",
+            Self::All => "all",
+            Self::DeprecatedDeclarations => "deprecated-declarations",
+        }
+    }
+
+    fn msvc_flag(&self) -> &'static str {
+        match self {
+            Self::Error => "/WX",
+            Self::Pedantic => "/W4",
+            Self::Extra => "/W4",
+            Self::All => "/W3",
+            Self::DeprecatedDeclarations => "/wd4996",
         }
     }
 
     pub fn warning_flag(&self, tool_chain: &ToolChain) -> String {
         match tool_chain {
-            ToolChain::Msvc => self.to_string(tool_chain),
-            _ => format!("-W{}", self.to_string(tool_chain)),
+            ToolChain::Msvc => self.msvc_flag().to_string(),
+            _ => format!("-W{}", self.name()),
         }
     }
 
     pub fn no_warning_flag(&self, tool_chain: &ToolChain) -> String {
         match tool_chain {
-            ToolChain::Msvc => self.to_string(tool_chain),
-            _ => format!("-Wno-{}", self.to_string(tool_chain)),
+            ToolChain::Msvc => self.msvc_flag().to_string(),
+            _ => format!("-Wno-{}", self.name()),
         }
     }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompilerFlags {
-    #[serde(default = "Vec::new")]
+    #[serde(default)]
     pub warnings: Vec<WarningFlag>,
-    #[serde(default = "Vec::new")]
+    #[serde(default)]
     pub no_warnings: Vec<WarningFlag>,
-    #[serde(default = "Vec::new")]
+    #[serde(default)]
     pub custom: Vec<String>,
 }
 
@@ -255,18 +249,18 @@ pub struct Graph {
     pub output: PathBuf,
     #[serde(default = "default_src")]
     pub src_dir: PathBuf,
-    #[serde(default = "Vec::new")]
+    #[serde(default)]
     pub includes: Vec<PathBuf>,
-    #[serde(default = "Vec::new")]
+    #[serde(default)]
     pub public_includes: Vec<PathBuf>,
-    #[serde(default = "Vec::new")]
+    #[serde(default)]
     pub lib_paths: Vec<String>,
-    #[serde(default = "Vec::new")]
+    #[serde(default)]
     pub libs: Vec<String>,
-    #[serde(default = "CompilerFlags::default")]
+    #[serde(default)]
     pub args: CompilerFlags,
     pub excludes: Option<Vec<PathBuf>>,
-    #[serde(default = "Vec::new")]
+    #[serde(default)]
     pub deps: Vec<usize>,
     #[serde(skip)]
     pub full_rebuild: bool,
@@ -355,8 +349,8 @@ impl BuildRegistry {
 }
 
 impl Graph {
-    const CACHE_DIR: &'static str = ".cargoc";
-    const OBJ_DIR: &'static str = "obj";
+    const CACHE_DIR: &str = ".cargoc";
+    const OBJ_DIR: &str = "obj";
 
     pub fn validate_dependencies(&self, registry: &BuildRegistry) -> Result<()> {
         for dep_id in &self.deps {
@@ -393,26 +387,33 @@ impl Graph {
     pub async fn build_with_registry(&self, registry: &BuildRegistry) -> Result<PathBuf> {
         self.validate_dependencies(registry)?;
 
-        if let Ok(exists) = fs::try_exists(Self::CACHE_DIR).await && !exists {
+        if let Ok(exists) = fs::try_exists(Self::CACHE_DIR).await
+            && !exists
+        {
             fs::create_dir(Self::CACHE_DIR).await?;
         }
         let obj_dir = Path::new(Self::CACHE_DIR).join(Self::OBJ_DIR);
-        if let Ok(exists) = fs::try_exists(&obj_dir).await && !exists {
+        if let Ok(exists) = fs::try_exists(&obj_dir).await
+            && !exists
+        {
             fs::create_dir(&obj_dir).await?;
         }
 
         let input_files = self.input_files(registry).await?;
 
         for file in &input_files {
-            if let Some(dir) = file.output_path.parent() && let Ok(exists) = fs::try_exists(dir).await && !exists {
+            if let Some(dir) = file.output_path.parent()
+                && let Ok(exists) = fs::try_exists(dir).await
+                && !exists
+            {
                 fs::create_dir_all(dir).await?;
             }
         }
 
         let mut set = JoinSet::new();
-        input_files.into_iter().for_each(|file| {
+        for file in input_files {
             set.spawn(async move { file.compile().await });
-        });
+        }
         let output_files = set
             .join_all()
             .await
@@ -459,7 +460,7 @@ impl Graph {
     }
 
     async fn link(&self, files: &[OutputFile], dep_outputs: &[PathBuf]) -> Result<PathBuf> {
-        if !self.should_recompile(files, dep_outputs)? {
+        if !self.should_recompile(files, dep_outputs).await? {
             tracing::info!(
                 "{} is up to date",
                 display_path_relative(&self.output_path(), &self.project_root)
@@ -517,7 +518,7 @@ impl Graph {
         };
 
         for file in files {
-            if file.is_dir() {
+            if fs::metadata(file).await?.is_dir() {
                 input_files.extend(Self::read_dir(file).await?);
             } else {
                 input_files.push(file.clone());
@@ -525,27 +526,13 @@ impl Graph {
         }
 
         let includes = self.compile_includes(registry)?;
-        let mut hasher = Sha224::new();
 
         Ok(input_files
             .into_iter()
             .map(|file| {
-                hasher.update(file.display().to_string().as_bytes());
-                let stem = file
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .filter(|stem| !stem.is_empty())
-                    .unwrap_or("obj");
-                let output = format!("{stem}-{:X}", hasher.finalize_reset());
-                let output = Path::new(Self::CACHE_DIR)
-                    .join(Self::OBJ_DIR)
-                    .join(output)
-                    .with_extension(self.tool_chain.obj_file_ext());
-                (file, output)
-            })
-            .map(|(input, output)| {
+                let output = Self::object_path(&file, &self.tool_chain);
                 InputFile::new(
-                    input,
+                    file,
                     output,
                     self.tool_chain.clone(),
                     self.args.clone(),
@@ -614,42 +601,66 @@ impl Graph {
             return;
         }
 
-        self.libs.iter().for_each(|lib| {
+        for lib in &self.libs {
             if self.tool_chain == ToolChain::Msvc {
                 cmd.arg(format!("{lib}.lib"));
             } else {
                 cmd.arg(format!("{}{}", self.tool_chain.linker_link_lib(), lib));
             }
-        });
-        self.lib_paths.iter().for_each(|path| {
-            cmd.arg(format!("{}{}", self.tool_chain.linker_link_dir_flag(), path));
-        });
+        }
+        for path in &self.lib_paths {
+            cmd.arg(format!(
+                "{}{}",
+                self.tool_chain.linker_link_dir_flag(),
+                path
+            ));
+        }
     }
 
-    fn should_recompile(&self, files: &[OutputFile], dep_outputs: &[PathBuf]) -> Result<bool> {
+    fn object_path(path: &Path, tool_chain: &ToolChain) -> PathBuf {
+        let mut hasher = Sha224::new();
+        hasher.update(path.display().to_string().as_bytes());
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or("obj");
+        let file_name = format!("{stem}-{:X}", hasher.finalize());
+        Path::new(Self::CACHE_DIR)
+            .join(Self::OBJ_DIR)
+            .join(file_name)
+            .with_extension(tool_chain.obj_file_ext())
+    }
+
+    async fn should_recompile(
+        &self,
+        files: &[OutputFile],
+        dep_outputs: &[PathBuf],
+    ) -> Result<bool> {
         if self.full_rebuild {
             return Ok(true);
         }
-        let Ok(output_metadata) = self.output_path().metadata() else {
+        let Ok(output_metadata) = fs::metadata(self.output_path()).await else {
             return Ok(true);
         };
+        let output_modified = output_metadata.modified()?;
 
         for file in files {
-            let metadata = file.path.metadata()?;
-            if metadata.modified()? > output_metadata.modified()? {
+            let metadata = fs::metadata(&file.path).await?;
+            if metadata.modified()? > output_modified {
                 return Ok(true);
             }
         }
 
         for dep_output in dep_outputs {
-            let metadata = dep_output.metadata().map_err(|_| {
+            let metadata = fs::metadata(dep_output).await.map_err(|_| {
                 anyhow::anyhow!(
                     "dependency output missing for `{}`: {}",
                     self.name,
                     display_path(dep_output)
                 )
             })?;
-            if metadata.modified()? > output_metadata.modified()? {
+            if metadata.modified()? > output_modified {
                 return Ok(true);
             }
         }
@@ -685,12 +696,14 @@ impl Graph {
             let mut files = Vec::new();
             let mut read_dir = read_dir(path).await?;
             while let Some(entry) = read_dir.next_entry().await? {
-                if entry.path().is_dir() {
-                    files.extend(Self::read_dir(entry.path()).await?);
+                let entry_path = entry.path();
+                if fs::metadata(&entry_path).await?.is_dir() {
+                    files.extend(Self::read_dir(entry_path).await?);
                 } else {
-                    files.push(entry.path());
+                    files.push(entry_path);
                 }
             }
+            files.sort_unstable();
             Ok(files)
         })
     }
@@ -731,7 +744,13 @@ mod tests {
     #[test]
     fn dependency_order_and_transitive_exports_are_stable() {
         let registry = BuildRegistry::new([
-            make_graph(1, "core", BinaryType::StaticLib, vec![], vec!["include/core"]),
+            make_graph(
+                1,
+                "core",
+                BinaryType::StaticLib,
+                vec![],
+                vec!["include/core"],
+            ),
             make_graph(2, "ui", BinaryType::StaticLib, vec![1], vec!["include/ui"]),
             make_graph(3, "app", BinaryType::Executable, vec![2], vec![]),
         ]);
@@ -747,7 +766,11 @@ mod tests {
         );
 
         let libs = app.transitive_static_lib_outputs(&registry).unwrap();
-        let expected_ext = if cfg!(target_os = "windows") { "lib" } else { "a" };
+        let expected_ext = if cfg!(target_os = "windows") {
+            "lib"
+        } else {
+            "a"
+        };
         assert_eq!(
             libs,
             vec![
@@ -778,7 +801,29 @@ mod tests {
         ]);
 
         let app = registry.get(2).unwrap();
-        let err = app.validate_dependencies(&registry).unwrap_err().to_string();
-        assert!(err.contains("only Executable -> StaticLib and StaticLib -> StaticLib are supported"));
+        let err = app
+            .validate_dependencies(&registry)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("only Executable -> StaticLib and StaticLib -> StaticLib are supported")
+        );
+    }
+
+    #[test]
+    fn warning_flags_match_the_toolchain() {
+        assert_eq!(
+            WarningFlag::Error.warning_flag(&ToolChain::Clang),
+            "-Werror"
+        );
+        assert_eq!(
+            WarningFlag::DeprecatedDeclarations.no_warning_flag(&ToolChain::Gcc),
+            "-Wno-deprecated-declarations"
+        );
+        assert_eq!(WarningFlag::Error.warning_flag(&ToolChain::Msvc), "/WX");
+        assert_eq!(
+            WarningFlag::DeprecatedDeclarations.no_warning_flag(&ToolChain::Msvc),
+            "/wd4996"
+        );
     }
 }

@@ -5,11 +5,6 @@ return function (build)
     local no_warnings = { "DeprecatedDeclarations" };
     local core_project = build:use_project("./example/core_project");
 
-    if tool_chain == "Msvc" then
-        warnings = {}
-        no_warnings = {};
-    end
-
     local main = build:add_binary({
         name = "main",
         tool_chain = tool_chain,

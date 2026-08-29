@@ -1,8 +1,10 @@
+use std::{ffi::OsString, path::Path};
+
+pub mod database;
 pub mod file;
 pub mod graph;
-pub mod database;
 
-pub fn display_path(path: &std::path::Path) -> String {
+pub fn display_path(path: &Path) -> String {
     path.display().to_string().replace("\\\\?\\", "")
 }
 
@@ -27,13 +29,11 @@ pub trait CommandExt {
 
 impl CommandExt for std::process::Command {
     fn display(&self) -> String {
-        let mut output = std::ffi::OsString::from(display_path(std::path::Path::new(
-            self.get_program(),
-        )));
-        self.get_args().for_each(|arg| {
+        let mut output = OsString::from(display_path(Path::new(self.get_program())));
+        for arg in self.get_args() {
             output.push(" ");
             output.push(arg.to_string_lossy().replace("\\\\?\\", ""));
-        });
+        }
         output.to_string_lossy().to_string()
     }
 }

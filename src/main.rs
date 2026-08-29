@@ -3,7 +3,7 @@ mod init;
 
 use anyhow::Result;
 use build::Build;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use mlua::prelude::*;
 use std::{path::PathBuf, process::ExitCode};
 use tracing::{Level, level_filters::LevelFilter};
@@ -11,27 +11,49 @@ use tracing_subscriber::prelude::*;
 
 #[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
 enum Action {
-    Build,
-    Run,
-    GenDatabase,
-    Clean,
-    Init {
-        /// Project name (also used as the new directory name)
-        name: String,
-        /// Create a binary project
-        #[arg(long)]
-        bin: bool,
-        /// Create a library project
-        #[arg(long)]
-        lib: bool,
-    },
+    Build(PassthroughArgs),
+    Run(PassthroughArgs),
+    GenDatabase(PassthroughArgs),
+    Clean(PassthroughArgs),
+    Init(InitArgs),
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq, Default)]
+struct PassthroughArgs {
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "ARG",
+        help = "Arguments available to the build script"
+    )]
+    args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+struct InitArgs {
+    /// Project name (also used as the new directory name)
+    name: String,
+    /// Create a binary project
+    #[arg(long)]
+    bin: bool,
+    /// Create a library project
+    #[arg(long)]
+    lib: bool,
+    #[command(flatten)]
+    passthrough: PassthroughArgs,
 }
 
 impl Action {
     pub fn parse_only(&self) -> bool {
+        matches!(self, Self::GenDatabase(_) | Self::Clean(_))
+    }
+
+    fn unused_cli_args(&self) -> &[String] {
         match self {
-            Action::GenDatabase | Action::Clean => true,
-            _ => false,
+            Self::Build(args) | Self::Run(args) | Self::GenDatabase(args) | Self::Clean(args) => {
+                &args.args
+            }
+            Self::Init(args) => &args.passthrough.args,
         }
     }
 }
@@ -46,7 +68,7 @@ struct Cli {
         default_value = "build.lua",
         help = "Build script path"
     )]
-    build_scirpt: PathBuf,
+    build_script: PathBuf,
     #[command(subcommand)]
     command: Action,
     #[arg(short = 'B', help = "Full rebuild", global = true)]
@@ -63,7 +85,7 @@ async fn main() -> Result<ExitCode> {
 
     let level = if args.verbose {
         LevelFilter::TRACE
-    }else {
+    } else {
         LevelFilter::INFO
     };
 
@@ -84,8 +106,8 @@ async fn main() -> Result<ExitCode> {
         }))
         .init();
 
-    if let Action::Init { name, bin, lib } = &args.command {
-        return Ok(match init::init_project(name, *bin, *lib) {
+    if let Action::Init(init) = &args.command {
+        return Ok(match init::init_project(&init.name, init.bin, init.lib) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 tracing::error!("{e:#}");
@@ -118,21 +140,55 @@ async fn main() -> Result<ExitCode> {
     let build = Build::new(args.clone())?;
     let script_path = build.root_script_path()?;
     let build = lua.create_userdata(build)?;
-    lua.globals().set("__cargoc_build", build.clone())?;
+    lua.globals().set("build", build.clone())?;
 
-    let chunk = lua.load(script_path);
-    let out = chunk.eval_async::<LuaFunction>().await?;
+    let out = build::load_script(&lua, &script_path).await?;
     let res = out.call_async::<()>(&build).await;
     if let Ok(build_ref) = build.borrow::<Build>() {
         let _ = build_ref.finish_root_load();
     }
-    //println!("{:#?}", build.borrow::<Build>());
     let exit = match res {
         Ok(_) => ExitCode::SUCCESS,
-        Err(e) => {
-            tracing::error!("{e}");
+        Err(error) => {
+            tracing::error!("{error}");
             ExitCode::FAILURE
         }
     };
     Ok(exit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captures_unused_cli_args_after_command() {
+        let cli = Cli::try_parse_from(["cargoc", "build", "--forwarded", "value", "-5"]).unwrap();
+
+        assert_eq!(
+            cli.command.unused_cli_args(),
+            ["--forwarded", "value", "-5"]
+        );
+    }
+
+    #[test]
+    fn exposes_unused_cli_args_to_lua() {
+        let lua = Lua::new();
+        let build = Build::new(Cli {
+            build_script: PathBuf::from("build.lua"),
+            command: Action::Build(PassthroughArgs {
+                args: vec!["first".into(), "--second".into()],
+            }),
+            full_rebuild: false,
+            release: false,
+            verbose: false,
+        })
+        .unwrap();
+        let build = lua.create_userdata(build).unwrap();
+        lua.globals().set("build", build).unwrap();
+
+        let args: Vec<String> = lua.load("return build:unused_cli_args()").eval().unwrap();
+
+        assert_eq!(args, ["first", "--second"]);
+    }
 }
