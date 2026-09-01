@@ -54,5 +54,5 @@
 ---@field host_os fun(self: Build): Os
 ---@field should_generate_database fun(self: Build): boolean
 ---@field generate_database async fun(self: Build, path: string?): boolean
----@field read_dir async fun(self: Build, path: string, ext: string?): string[]
+---@field read_dir async fun(path: string, ext: string?): string[]
 ---@field unused_cli_args fun(self: Build): string[]
