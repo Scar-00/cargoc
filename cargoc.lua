@@ -34,7 +34,7 @@
 ---@field subdir ?string Relative project directory within the dependency.
 ---@field build_system ?"cargoc"|"cmake" Override automatic build-system detection.
 ---@field cmake_options ?table<string, string|boolean|number> CMake cache options.
----@field tool_chain ?ToolChain CMake compiler selection; currently Gcc or Clang.
+---@field tool_chain ?ToolChain CMake compiler selection; Gcc, Clang, or Msvc.
 
 ---@class Graph
 ---@field name string

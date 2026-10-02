@@ -699,13 +699,14 @@ impl Build {
         };
         let source = if let Some(git) = &spec.git {
             // A local Git repository is resolved relative to its importing project.
-            let url = if !git.contains("://") && !git.contains(':') {
-                let candidate = current_root.join(git);
-                let absolute = candidate.absolutize().into_lua_err()?.to_path_buf();
-                display_path(&absolute)
-            } else {
-                git.clone()
-            };
+            let url =
+                if Path::new(git).is_absolute() || (!git.contains("://") && !git.contains(':')) {
+                    let candidate = current_root.join(git);
+                    let absolute = candidate.absolutize().into_lua_err()?.to_path_buf();
+                    display_path(&absolute)
+                } else {
+                    git.clone()
+                };
             crate::dependency::git_source(&root, &url, spec.rev.as_deref())
                 .await
                 .into_lua_err()?
@@ -985,7 +986,7 @@ impl LuaUserData for Build {
                     .absolutize()
                     .map(|path| path.to_path_buf())
                     .unwrap_or(binary);
-                let mut cmd = Command::new(&binary);
+                let mut cmd = Command::new(cbuild::command_path(&binary));
                 cmd.stdout(Stdio::piped());
                 cmd.stderr(Stdio::piped());
                 cmd.args(&args);

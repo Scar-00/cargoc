@@ -32,7 +32,7 @@ impl ExternalBuild {
         let mut command = Command::new("cmake");
         command
             .arg("--build")
-            .arg(&self.build_dir)
+            .arg(crate::command_path(&self.build_dir))
             .arg("--config")
             .arg(&self.configuration);
         if clean_first {

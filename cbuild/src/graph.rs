@@ -657,14 +657,14 @@ impl Graph {
     }
 
     fn append_files(&self, cmd: &mut Command, files: &[OutputFile]) {
-        cmd.args(files.iter().map(|file| &file.path));
+        cmd.args(files.iter().map(|file| crate::command_path(&file.path)));
     }
 
     fn append_dependency_outputs(&self, cmd: &mut Command, dep_outputs: &[PathBuf]) {
         if self.typ == BinaryType::StaticLib {
             return;
         }
-        cmd.args(dep_outputs);
+        cmd.args(dep_outputs.iter().map(|path| crate::command_path(path)));
     }
 
     fn append_args(&self, cmd: &mut Command) {

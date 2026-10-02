@@ -88,7 +88,7 @@ Options:
 | `rev` | Git branch, tag, or commit. Defaults to remote `HEAD` on first fetch. |
 | `subdir` | Relative project directory inside the dependency, useful for monorepos. |
 | `build_system` | `"cargoc"` or `"cmake"`; otherwise detected automatically. |
-| `tool_chain` | CMake toolchain, currently `"Gcc"` or `"Clang"`. Defaults to the host toolchain. |
+| `tool_chain` | CMake toolchain, currently `"Gcc"`, `"Clang"`, or `"Msvc"`. Defaults to the host toolchain. |
 | `cmake_options` | CMake cache variables with string, boolean, or number values. |
 
 `tool_chain` and `cmake_options` apply to CMake imports. Use compatible compilers
@@ -114,10 +114,20 @@ core:export()
 ### CMake projects
 
 CMake imports currently support static libraries and interface/header libraries
-on Linux and macOS using GCC or Clang. They require CMake 3.20 or newer, a C and
-C++ compiler, and the build program selected by CMake (usually Make or Ninja).
-Windows imports, shared-library exports, compilable interface source files,
-Meson, and arbitrary Makefiles are not implemented yet.
+on Linux, macOS, and Windows using GCC, Clang, or MSVC. They require CMake 3.20
+or newer, a C and C++ compiler, and the build program selected by CMake.
+Shared-library exports, compilable interface source files, Meson, and arbitrary
+Makefiles are not implemented yet.
+
+On Windows with MSVC, run cargoc in a Visual Studio Developer PowerShell or
+Developer Command Prompt so `cl.exe`, `link.exe`, and `nmake.exe` are on PATH.
+The default MSVC generator is `NMake Makefiles`; GCC/Clang use `Ninja`, which must
+be installed separately. Set `CMAKE_GENERATOR` to override this choice.
+Use the same `tool_chain` for the dependency and your application, for example
+`build:default_toolchain()` (MSVC on Windows). CMake's consumer compiler settings
+are retained on Windows so Debug/Release CRT selection matches the dependency.
+Git and CMake receive ordinary Windows paths rather than Rust's `\\?\` verbatim
+paths; internal filesystem operations retain the canonical paths.
 
 The imported project must work as a CMake subdirectory. Projects that require
 being the top-level source directory may need changes upstream. Use actual

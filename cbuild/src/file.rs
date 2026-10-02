@@ -121,6 +121,14 @@ impl InputFile {
         self.append_output_file(&mut command);
         self.append_args(&mut command);
         self.append_includes(&mut command);
+        if self.tool_chain == ToolChain::Msvc {
+            // Each object gets its own compiler PDB; /FS handles simultaneous
+            // cl invocations without sharing the default vc*.pdb in the cwd.
+            command.arg("/FS").arg(format!(
+                "/Fd{}",
+                display_path(&self.output_path.with_extension("pdb"))
+            ));
+        }
         if self.tracks_headers() {
             command
                 .arg("-MD")

@@ -1,13 +1,13 @@
 use crate::dependency::{CmakeOption, ProjectSpec, cache_key, run_command};
 use anyhow::{Context, Result, bail};
 use cbuild::{
-    display_path,
+    command_path, display_path,
     external::{ExternalBuild, UsageRequirements},
     graph::ToolChain,
 };
 use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -31,6 +31,7 @@ pub(crate) fn project_dir(
     let key = cache_key(serde_json::to_vec(&(
         display_path(source),
         &spec.cmake_options,
+        generator(&toolchain),
         toolchain,
         configuration,
     ))?);
@@ -147,17 +148,86 @@ struct Fragment {
     role: String,
 }
 
-fn split_fragment(fragment: &str) -> Result<Vec<String>> {
-    // CMake reports native shell fragments. This backend currently supports
-    // Unix command syntax; Windows requires CommandLineToArgvW semantics.
-    shlex::split(fragment).with_context(|| format!("invalid CMake command fragment: {fragment}"))
+// CMake fragments are encoded for the host shell. Windows backslashes must
+// survive parsing, including paths containing spaces and escaped quotes.
+fn split_fragment_for_platform(fragment: &str, windows: bool) -> Result<Vec<String>> {
+    if windows {
+        Ok(split_windows_fragment(fragment))
+    } else {
+        shlex::split(fragment)
+            .with_context(|| format!("invalid CMake command fragment: {fragment}"))
+    }
 }
 
-fn compile_args(target: &Target, toolchain: &ToolChain) -> Result<Vec<String>> {
+// Microsoft C runtime argument rules: only backslashes immediately before a
+// quote are escapes; pairs produce a backslash and an odd remainder a quote.
+fn split_windows_fragment(fragment: &str) -> Vec<String> {
+    let mut characters = fragment.chars().peekable();
+    let mut arguments = Vec::new();
+    loop {
+        while characters.peek().is_some_and(|c| matches!(c, ' ' | '\t')) {
+            characters.next();
+        }
+        if characters.peek().is_none() {
+            break;
+        }
+        let mut argument = String::new();
+        let mut quoted = false;
+        while let Some(&character) = characters.peek() {
+            if matches!(character, ' ' | '\t') && !quoted {
+                break;
+            }
+            let mut backslashes = 0;
+            while characters.peek() == Some(&'\\') {
+                characters.next();
+                backslashes += 1;
+            }
+            if characters.peek() == Some(&'"') {
+                argument.extend(std::iter::repeat_n('\\', backslashes / 2));
+                characters.next();
+                if backslashes % 2 == 1 {
+                    argument.push('"');
+                } else if quoted && characters.peek() == Some(&'"') {
+                    characters.next();
+                    argument.push('"');
+                } else {
+                    quoted = !quoted;
+                }
+            } else {
+                argument.extend(std::iter::repeat_n('\\', backslashes));
+                match characters.peek() {
+                    Some(' ' | '\t') if !quoted => break,
+                    Some(_) => argument.push(characters.next().unwrap()),
+                    None => break,
+                }
+            }
+        }
+        arguments.push(argument);
+    }
+    arguments
+}
+
+fn generator(toolchain: &ToolChain) -> Option<String> {
+    std::env::var("CMAKE_GENERATOR")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            cfg!(windows).then(|| {
+                if *toolchain == ToolChain::Msvc {
+                    "NMake Makefiles"
+                } else {
+                    "Ninja"
+                }
+                .to_string()
+            })
+        })
+}
+
+fn compile_args(target: &Target, toolchain: &ToolChain, windows: bool) -> Result<Vec<String>> {
     let mut arguments = Vec::new();
     for group in &target.compile_groups {
         for fragment in &group.compile_command_fragments {
-            arguments.extend(split_fragment(&fragment.fragment)?);
+            arguments.extend(split_fragment_for_platform(&fragment.fragment, windows)?);
         }
         for define in &group.defines {
             arguments.push(format!(
@@ -196,18 +266,26 @@ fn usage(
     baseline: &Target,
     build_dir: &Path,
     toolchain: &ToolChain,
+    windows: bool,
+    artifacts: &HashSet<PathBuf>,
 ) -> Result<UsageRequirements> {
     let mut requirements = UsageRequirements {
-        compile_args: remove_baseline(
-            compile_args(target, toolchain)?,
-            &compile_args(baseline, toolchain)?,
-        ),
+        // Windows native consumers need CMake's CRT and exception defaults as
+        // well as exported settings, notably /MDd versus /MD for MSVC.
+        compile_args: if windows {
+            compile_args(target, toolchain, windows)?
+        } else {
+            remove_baseline(
+                compile_args(target, toolchain, windows)?,
+                &compile_args(baseline, toolchain, windows)?,
+            )
+        },
         ..UsageRequirements::default()
     };
     if let Some(link) = &target.link {
         requirements.requires_cxx = link.language == "CXX";
         for fragment in &link.command_fragments {
-            let arguments = split_fragment(&fragment.fragment)?;
+            let arguments = split_fragment_for_platform(&fragment.fragment, windows)?;
             if fragment.role == "libraries" {
                 let mut flag_value = false;
                 for argument in arguments {
@@ -217,7 +295,7 @@ fn usage(
                     } else if matches!(argument.as_str(), "-framework" | "-weak_framework" | "-l") {
                         requirements.link_args.push(argument);
                         flag_value = true;
-                    } else if !argument.starts_with('-') {
+                    } else if is_library_file(&argument, build_dir, artifacts, windows) {
                         let path = PathBuf::from(&argument);
                         let path = if path.is_absolute() {
                             path
@@ -238,7 +316,9 @@ fn usage(
                         link.command_fragments
                             .iter()
                             .filter(|fragment| fragment.role == "flags")
-                            .map(|fragment| split_fragment(&fragment.fragment))
+                            .map(|fragment| {
+                                split_fragment_for_platform(&fragment.fragment, windows)
+                            })
                             .collect::<Result<Vec<_>>>()
                             .map(|fragments| fragments.into_iter().flatten().collect::<Vec<_>>())
                     })
@@ -255,6 +335,23 @@ fn usage(
     Ok(requirements)
 }
 
+fn is_library_file(
+    argument: &str,
+    build_dir: &Path,
+    artifacts: &HashSet<PathBuf>,
+    windows: bool,
+) -> bool {
+    if argument.starts_with('-')
+        || (windows && argument.starts_with('/') && !argument.starts_with("//"))
+    {
+        return false;
+    }
+    if windows && !argument.contains(['/', '\\', ':']) {
+        return artifacts.contains(&build_dir.join(argument));
+    }
+    true
+}
+
 async fn write_if_changed(path: &Path, contents: &[u8]) -> Result<()> {
     if fs::read(path).await.ok().as_deref() != Some(contents) {
         fs::write(path, contents).await?;
@@ -268,22 +365,17 @@ pub(crate) async fn configure(
     spec: &ProjectSpec,
     configuration: &str,
 ) -> Result<Vec<ImportedTarget>> {
-    if cfg!(windows) {
-        bail!(
-            "CMake imports currently support Linux and macOS; Windows command-fragment parsing is not implemented yet"
-        );
-    }
     let toolchain = spec
         .tool_chain
         .clone()
         .unwrap_or_else(ToolChain::platform_default);
-    if matches!(
-        toolchain,
-        ToolChain::Zig | ToolChain::Msvc | ToolChain::Custom { .. }
-    ) {
+    if matches!(toolchain, ToolChain::Zig | ToolChain::Custom { .. }) {
         bail!(
-            "CMake imports currently support Gcc and Clang toolchains; set `tool_chain` accordingly"
+            "CMake imports support Gcc, Clang, and Msvc toolchains; set `tool_chain` accordingly"
         );
+    }
+    if toolchain == ToolChain::Msvc && !cfg!(windows) {
+        bail!("the Msvc toolchain requires Windows");
     }
     let wrapper_dir = cache_dir.join("wrapper");
     let build_dir = cache_dir.join("build");
@@ -321,9 +413,12 @@ pub(crate) async fn configure(
     let mut command = Command::new("cmake");
     command
         .arg("-S")
-        .arg(&wrapper_dir)
+        .arg(command_path(&wrapper_dir))
         .arg("-B")
-        .arg(&build_dir);
+        .arg(command_path(&build_dir));
+    if let Some(generator) = generator(&toolchain) {
+        command.arg("-G").arg(generator);
+    }
     for (name, value) in options {
         if name.is_empty()
             || !name
@@ -391,6 +486,15 @@ pub(crate) async fn configure(
         id_names.insert(id.to_string(), target.name.clone());
         targets.insert(target.name.clone(), target);
     }
+    let artifacts: HashSet<_> = targets
+        .values()
+        .flat_map(|target| {
+            target
+                .artifacts
+                .iter()
+                .map(|artifact| build_dir.join(&artifact.path))
+        })
+        .collect();
     let names = fs::read_to_string(build_dir.join("cargoc-targets.txt")).await?;
     if names.trim().is_empty() {
         bail!(
@@ -452,6 +556,8 @@ pub(crate) async fn configure(
                         .context("missing CMake C baseline")?,
                     &build_dir,
                     &toolchain,
+                    cfg!(windows),
+                    &artifacts,
                 )?,
                 cxx: usage(
                     cxx,
@@ -460,10 +566,126 @@ pub(crate) async fn configure(
                         .context("missing CMake C++ baseline")?,
                     &build_dir,
                     &toolchain,
+                    cfg!(windows),
+                    &artifacts,
                 )?,
                 lock: Arc::clone(&lock),
             },
         });
     }
     Ok(imported)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_fragments_keep_paths_spaces_and_msvc_flags() {
+        assert_eq!(
+            split_windows_fragment(
+                r#""C:\Program Files\SDK\fmt.lib" kernel32.lib /LIBPATH:"C:\third party\lib" C:\src\main.cpp"#
+            ),
+            [
+                r"C:\Program Files\SDK\fmt.lib",
+                "kernel32.lib",
+                r"/LIBPATH:C:\third party\lib",
+                r"C:\src\main.cpp"
+            ]
+        );
+        assert_eq!(
+            split_windows_fragment(r#"/DNAME=\"hello\" "" plain"#),
+            [r#"/DNAME="hello""#, "", "plain"]
+        );
+        assert_eq!(
+            split_windows_fragment(r#""C:\path with space\\" "say ""hello""""#),
+            [r"C:\path with space\", r#"say "hello""#]
+        );
+    }
+
+    #[test]
+    fn windows_fragments_follow_microsoft_backslash_examples() {
+        for (fragment, expected) in [
+            (r#""abc" d e"#, vec!["abc", "d", "e"]),
+            (r#"a\\\b d"e f"g h"#, vec![r"a\\\b", "de fg", "h"]),
+            (r#"a\\\"b c d"#, vec![r#"a\"b"#, "c", "d"]),
+            (r#"a\\\\"b c" d e"#, vec![r"a\\b c", "d", "e"]),
+        ] {
+            assert_eq!(split_windows_fragment(fragment), expected, "{fragment}");
+        }
+    }
+
+    #[test]
+    fn windows_library_names_are_distinguished_from_file_paths() {
+        let root = Path::new("C:/cache");
+        let artifacts = HashSet::from([root.join("fmt.lib")]);
+        for name in [
+            "kernel32.lib",
+            "user32.lib",
+            "/DEFAULTLIB:MSVCRT",
+            "-lstdc++",
+        ] {
+            assert!(!is_library_file(name, root, &artifacts, true), "{name}");
+        }
+        for path in [
+            "fmt.lib",
+            "upstream/Debug/fmtd.lib",
+            r"C:\SDK\fmt.lib",
+            "//server/share/fmt.lib",
+        ] {
+            assert!(is_library_file(path, root, &artifacts, true), "{path}");
+        }
+    }
+
+    #[test]
+    fn msvc_usage_preserves_crt_defaults_and_system_library_names() {
+        let baseline: Target = serde_json::from_value(serde_json::json!({
+            "name": "baseline", "type": "EXECUTABLE",
+            "compileGroups": [{ "compileCommandFragments": [{"fragment": "/MDd /EHsc /Zi"}] }],
+            "link": { "language": "CXX", "commandFragments": [{ "fragment": "/DEBUG", "role": "flags" }] }
+        })).unwrap();
+        let consumer: Target = serde_json::from_value(serde_json::json!({
+            "name": "consumer", "type": "EXECUTABLE",
+            "compileGroups": [{ "compileCommandFragments": [{"fragment": "/MDd /EHsc /Zi"}], "defines": [{ "define": "FMT_TEST=1" }],
+                "includes": [{ "path": "C:/source/include space" }] }],
+            "link": { "language": "CXX", "commandFragments": [
+                { "fragment": "/DEBUG /WHOLEARCHIVE:fmt.lib", "role": "flags" },
+                { "fragment": "\"upstream with space/fmtd.lib\" kernel32.lib user32.lib", "role": "libraries" }
+            ] }
+        })).unwrap();
+        let root = Path::new("C:/cache");
+        let requirements = usage(
+            &consumer,
+            &baseline,
+            root,
+            &ToolChain::Msvc,
+            true,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            requirements.compile_args,
+            [
+                "/MDd",
+                "/EHsc",
+                "/Zi",
+                "/DFMT_TEST=1",
+                "/IC:/source/include space"
+            ]
+        );
+        assert_eq!(
+            requirements.link_args,
+            [
+                "/WHOLEARCHIVE:fmt.lib".to_string(),
+                display_path(&root.join("upstream with space/fmtd.lib")),
+                "kernel32.lib".to_string(),
+                "user32.lib".to_string()
+            ]
+        );
+        assert_eq!(
+            requirements.link_inputs,
+            [root.join("upstream with space/fmtd.lib")]
+        );
+        assert!(requirements.requires_cxx);
+    }
 }

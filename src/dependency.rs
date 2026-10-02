@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use cbuild::graph::ToolChain;
+use cbuild::{command_path, graph::ToolChain};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -169,7 +169,7 @@ pub(crate) async fn git_source(root: &Path, url: &str, revision: Option<&str>) -
             let head = run_command(
                 Command::new("git")
                     .arg("-C")
-                    .arg(&source_dir)
+                    .arg(command_path(&source_dir))
                     .args(["rev-parse", "HEAD"]),
                 "checking cached dependency",
             )
@@ -198,7 +198,7 @@ pub(crate) async fn git_source(root: &Path, url: &str, revision: Option<&str>) -
             Command::new("git")
                 .args(["clone", "--no-checkout", "--"])
                 .arg(url)
-                .arg(&staging),
+                .arg(command_path(&staging)),
             "cloning dependency",
         )
         .await?;
@@ -208,40 +208,34 @@ pub(crate) async fn git_source(root: &Path, url: &str, revision: Option<&str>) -
             .unwrap_or(rev);
         // Fetch the requested ref explicitly, including refs outside the default branch.
         run_command(
-            Command::new("git").arg("-C").arg(&staging).args([
-                "fetch",
-                "--no-tags",
-                "--",
-                "origin",
-                requested,
-            ]),
+            Command::new("git")
+                .arg("-C")
+                .arg(command_path(&staging))
+                .args(["fetch", "--no-tags", "--", "origin", requested]),
             "fetching dependency revision",
         )
         .await?;
         let commit = run_command(
-            Command::new("git").arg("-C").arg(&staging).args([
-                "rev-parse",
-                "--verify",
-                "FETCH_HEAD^{commit}",
-            ]),
+            Command::new("git")
+                .arg("-C")
+                .arg(command_path(&staging))
+                .args(["rev-parse", "--verify", "FETCH_HEAD^{commit}"]),
             "resolving dependency revision",
         )
         .await?;
         run_command(
             Command::new("git")
                 .arg("-C")
-                .arg(&staging)
+                .arg(command_path(&staging))
                 .args(["checkout", "--detach", &commit]),
             "checking out dependency revision",
         )
         .await?;
         run_command(
-            Command::new("git").arg("-C").arg(&staging).args([
-                "submodule",
-                "update",
-                "--init",
-                "--recursive",
-            ]),
+            Command::new("git")
+                .arg("-C")
+                .arg(command_path(&staging))
+                .args(["submodule", "update", "--init", "--recursive"]),
             "fetching dependency submodules",
         )
         .await?;
