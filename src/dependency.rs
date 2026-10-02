@@ -19,6 +19,7 @@ pub(crate) struct ProjectSpec {
     #[serde(default)]
     pub cmake_options: BTreeMap<String, CmakeOption>,
     pub tool_chain: Option<ToolChain>,
+    pub cmake_generator: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -87,6 +88,13 @@ impl ProjectSpec {
                     .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_))))
         {
             bail!("`subdir` must be a relative path within the dependency");
+        }
+        if self
+            .cmake_generator
+            .as_deref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            bail!("`cmake_generator` must be a nonempty generator name such as Ninja");
         }
         if let Some(system) = &self.build_system
             && !matches!(system.as_str(), "cargoc" | "cmake")

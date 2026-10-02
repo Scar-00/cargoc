@@ -28,10 +28,15 @@ pub(crate) fn project_dir(
         .tool_chain
         .clone()
         .unwrap_or_else(ToolChain::platform_default);
+    let options: BTreeMap<_, _> = spec
+        .cmake_options
+        .iter()
+        .filter(|(name, _)| name.as_str() != "CMAKE_GENERATOR")
+        .collect();
     let key = cache_key(serde_json::to_vec(&(
         display_path(source),
-        &spec.cmake_options,
-        generator(&toolchain),
+        options,
+        generator(spec, &toolchain)?,
         toolchain,
         configuration,
     ))?);
@@ -207,12 +212,43 @@ fn split_windows_fragment(fragment: &str) -> Vec<String> {
     arguments
 }
 
-fn generator(toolchain: &ToolChain) -> Option<String> {
-    std::env::var("CMAKE_GENERATOR")
-        .ok()
-        .filter(|value| !value.is_empty())
+fn generator(spec: &ProjectSpec, toolchain: &ToolChain) -> Result<Option<String>> {
+    let environment = std::env::var("CMAKE_GENERATOR").ok();
+    select_generator(spec, toolchain, environment.as_deref(), cfg!(windows))
+}
+
+fn select_generator(
+    spec: &ProjectSpec,
+    toolchain: &ToolChain,
+    environment: Option<&str>,
+    windows: bool,
+) -> Result<Option<String>> {
+    // -G is the authoritative selection. Accept the former cache-variable
+    // spelling for compatibility, but never pass it back as -D as well.
+    let legacy = match spec.cmake_options.get("CMAKE_GENERATOR") {
+        Some(CmakeOption::String(name)) if !name.trim().is_empty() => Some(name.trim()),
+        Some(_) => bail!(
+            "cmake_options.CMAKE_GENERATOR must be a nonempty string; use cmake_generator = \"Ninja\""
+        ),
+        None => None,
+    };
+    let explicit = spec.cmake_generator.as_deref().map(str::trim);
+    if explicit.is_some_and(str::is_empty) {
+        bail!("cmake_generator must be a nonempty generator name");
+    }
+    if let (Some(explicit), Some(legacy)) = (explicit, legacy)
+        && explicit != legacy
+    {
+        bail!(
+            "cmake_generator `{explicit}` conflicts with cmake_options.CMAKE_GENERATOR `{legacy}`; specify the generator once"
+        );
+    }
+    Ok(explicit
+        .or(legacy)
+        .or_else(|| environment.map(str::trim).filter(|name| !name.is_empty()))
+        .map(str::to_string)
         .or_else(|| {
-            cfg!(windows).then(|| {
+            windows.then(|| {
                 if *toolchain == ToolChain::Msvc {
                     "NMake Makefiles"
                 } else {
@@ -220,7 +256,7 @@ fn generator(toolchain: &ToolChain) -> Option<String> {
                 }
                 .to_string()
             })
-        })
+        }))
 }
 
 fn compile_args(target: &Target, toolchain: &ToolChain, windows: bool) -> Result<Vec<String>> {
@@ -410,13 +446,14 @@ pub(crate) async fn configure(
         ),
     ]);
     options.extend(spec.cmake_options.clone());
+    options.remove("CMAKE_GENERATOR");
     let mut command = Command::new("cmake");
     command
         .arg("-S")
         .arg(command_path(&wrapper_dir))
         .arg("-B")
         .arg(command_path(&build_dir));
-    if let Some(generator) = generator(&toolchain) {
+    if let Some(generator) = generator(spec, &toolchain)? {
         command.arg("-G").arg(generator);
     }
     for (name, value) in options {
@@ -437,7 +474,7 @@ pub(crate) async fn configure(
     command.arg(format!("-DCMAKE_BUILD_TYPE={configuration}"));
     tracing::info!(
         "[Configuring CMake]: {} ({configuration})",
-        source.display()
+        display_path(source)
     );
     run_command(&mut command, "configuring CMake dependency").await?;
 
@@ -579,6 +616,93 @@ pub(crate) async fn configure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generator_selection_prefers_script_then_environment_then_platform_default() {
+        let mut spec = ProjectSpec::from_source("dep".to_string());
+        assert_eq!(
+            select_generator(&spec, &ToolChain::Msvc, None, true)
+                .unwrap()
+                .as_deref(),
+            Some("NMake Makefiles")
+        );
+        assert_eq!(
+            select_generator(&spec, &ToolChain::Gcc, None, true)
+                .unwrap()
+                .as_deref(),
+            Some("Ninja")
+        );
+        assert_eq!(
+            select_generator(&spec, &ToolChain::Gcc, None, false).unwrap(),
+            None
+        );
+        assert_eq!(
+            select_generator(&spec, &ToolChain::Msvc, Some("Ninja"), true)
+                .unwrap()
+                .as_deref(),
+            Some("Ninja")
+        );
+        spec.cmake_generator = Some("Ninja".to_string());
+        assert_eq!(
+            select_generator(&spec, &ToolChain::Msvc, Some("NMake Makefiles"), true)
+                .unwrap()
+                .as_deref(),
+            Some("Ninja")
+        );
+        spec.cmake_generator = None;
+        spec.cmake_options.insert(
+            "CMAKE_GENERATOR".to_string(),
+            CmakeOption::String("Ninja".to_string()),
+        );
+        assert_eq!(
+            select_generator(&spec, &ToolChain::Msvc, Some("NMake Makefiles"), true)
+                .unwrap()
+                .as_deref(),
+            Some("Ninja")
+        );
+    }
+
+    #[test]
+    fn different_generators_use_different_build_directories() {
+        let root = Path::new("project");
+        let source = root.join("dep");
+        let mut spec = ProjectSpec::from_source("dep".to_string());
+        spec.cmake_generator = Some("Ninja".to_string());
+        let ninja = project_dir(root, &source, &spec, "Debug").unwrap();
+        spec.cmake_generator = Some("Unix Makefiles".to_string());
+        let make = project_dir(root, &source, &spec, "Debug").unwrap();
+        assert_ne!(ninja, make);
+        spec.cmake_generator = None;
+        spec.cmake_options.insert(
+            "CMAKE_GENERATOR".to_string(),
+            CmakeOption::String("Ninja".to_string()),
+        );
+        assert_eq!(project_dir(root, &source, &spec, "Debug").unwrap(), ninja);
+    }
+
+    #[test]
+    fn conflicting_and_invalid_generator_options_report_clear_errors() {
+        let mut spec = ProjectSpec::from_source("dep".to_string());
+        spec.cmake_generator = Some("Ninja".to_string());
+        spec.cmake_options.insert(
+            "CMAKE_GENERATOR".to_string(),
+            CmakeOption::String("NMake Makefiles".to_string()),
+        );
+        assert!(
+            select_generator(&spec, &ToolChain::Msvc, None, true)
+                .unwrap_err()
+                .to_string()
+                .contains("conflicts")
+        );
+        spec.cmake_options
+            .insert("CMAKE_GENERATOR".to_string(), CmakeOption::Bool(true));
+        assert!(
+            select_generator(&spec, &ToolChain::Msvc, None, true)
+                .unwrap_err()
+                .to_string()
+                .contains("nonempty string")
+        );
+    }
 
     #[test]
     fn windows_fragments_keep_paths_spaces_and_msvc_flags() {

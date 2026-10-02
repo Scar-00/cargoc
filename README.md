@@ -89,9 +89,10 @@ Options:
 | `subdir` | Relative project directory inside the dependency, useful for monorepos. |
 | `build_system` | `"cargoc"` or `"cmake"`; otherwise detected automatically. |
 | `tool_chain` | CMake toolchain, currently `"Gcc"`, `"Clang"`, or `"Msvc"`. Defaults to the host toolchain. |
+| `cmake_generator` | CMake generator name, for example `"Ninja"` or `"NMake Makefiles"`. |
 | `cmake_options` | CMake cache variables with string, boolean, or number values. |
 
-`tool_chain` and `cmake_options` apply to CMake imports. Use compatible compilers
+`tool_chain`, `cmake_generator`, and `cmake_options` apply to CMake imports. Use compatible compilers
 for your application and its dependencies.
 
 ### Native cargoc projects
@@ -122,7 +123,20 @@ Makefiles are not implemented yet.
 On Windows with MSVC, run cargoc in a Visual Studio Developer PowerShell or
 Developer Command Prompt so `cl.exe`, `link.exe`, and `nmake.exe` are on PATH.
 The default MSVC generator is `NMake Makefiles`; GCC/Clang use `Ninja`, which must
-be installed separately. Set `CMAKE_GENERATOR` to override this choice.
+be installed separately. Set `cmake_generator` in the dependency options to
+choose a generator explicitly, or set the `CMAKE_GENERATOR` environment variable.
+The script setting takes precedence over the environment; for compatibility,
+`cmake_options.CMAKE_GENERATOR` is also accepted as a generator selection. A
+generator is passed using CMake's `-G` option, and each generator uses its own
+build cache, so changing it does not require deleting the previous build tree.
+
+```lua
+local fmt = build:use_project({
+    git = "https://github.com/fmtlib/fmt",
+    cmake_generator = "Ninja",
+    tool_chain = build:default_toolchain(),
+})
+```
 Use the same `tool_chain` for the dependency and your application, for example
 `build:default_toolchain()` (MSVC on Windows). CMake's consumer compiler settings
 are retained on Windows so Debug/Release CRT selection matches the dependency.

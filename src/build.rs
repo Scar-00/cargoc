@@ -735,9 +735,13 @@ impl Build {
                 )));
             }
         };
-        if system == "cargoc" && (!spec.cmake_options.is_empty() || spec.tool_chain.is_some()) {
+        if system == "cargoc"
+            && (!spec.cmake_options.is_empty()
+                || spec.tool_chain.is_some()
+                || spec.cmake_generator.is_some())
+        {
             return Err(mlua::Error::runtime(
-                "cmake_options and tool_chain are only valid for CMake imports",
+                "cmake_options, cmake_generator, and tool_chain are only valid for CMake imports",
             ));
         }
         let cache_dir = if system == "cmake" {

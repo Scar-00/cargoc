@@ -245,6 +245,80 @@ app:build_and_install()
 }
 
 #[test]
+fn cmake_generators_use_separate_caches_and_accept_legacy_options() {
+    if !cmake_available() || !available("ninja") {
+        eprintln!("skipping generator integration: requires Ninja");
+        return;
+    }
+    let project = Project::new("generators");
+    cmake_library(&project);
+    project.write("main.c", "#include <stdio.h>\n#include \"library.h\"\nint main(void) { printf(\"%d\\n\", base_value()); }\n");
+    let script = r#"
+local dep = build:use_project({path="dep", GENERATOR_OPTION})
+local app = build:add_binary({name="app", tool_chain="Gcc", opt_level="Debug", files={"main.c"}, output="app", deps={dep:artifact("base")}})
+app:build_and_install()
+"#;
+    let cached_generators = || {
+        let mut generators: Vec<_> = fs::read_dir(project.0.join(".cargoc/deps/cmake"))
+            .unwrap()
+            .map(|entry| {
+                let cache =
+                    fs::read_to_string(entry.unwrap().path().join("build/CMakeCache.txt")).unwrap();
+                cache
+                    .lines()
+                    .find_map(|line| line.strip_prefix("CMAKE_GENERATOR:INTERNAL="))
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        generators.sort();
+        generators
+    };
+    project.write(
+        "build.lua",
+        &script.replace("GENERATOR_OPTION", "cmake_generator=\"Ninja\""),
+    );
+    // Explicit script selection must override the environment, using -G.
+    successful(
+        Command::new(env!("CARGO_BIN_EXE_cargoc"))
+            .arg("build")
+            .env("CMAKE_GENERATOR", "Unix Makefiles")
+            .current_dir(&project.0)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(project.run("app"), "18\n");
+    assert_eq!(cached_generators(), ["Ninja"]);
+
+    project.write(
+        "build.lua",
+        &script.replace(
+            "GENERATOR_OPTION",
+            "cmake_options={CMAKE_GENERATOR=\"Ninja\"}",
+        ),
+    );
+    project.build();
+    assert_eq!(project.run("app"), "18\n");
+    assert_eq!(cached_generators(), ["Ninja"]);
+
+    project.write(
+        "build.lua",
+        &script.replace("GENERATOR_OPTION", "cmake_generator=\"Unix Makefiles\""),
+    );
+    project.build();
+    assert_eq!(project.run("app"), "18\n");
+    assert_eq!(cached_generators(), ["Ninja", "Unix Makefiles"]);
+
+    project.write(
+        "build.lua",
+        &script.replace("GENERATOR_OPTION", "cmake_generator=\"Ninja\""),
+    );
+    project.build();
+    assert_eq!(project.run("app"), "18\n");
+    assert_eq!(cached_generators(), ["Ninja", "Unix Makefiles"]);
+}
+
+#[test]
 fn git_dependencies_are_pinned_and_reused_offline() {
     if !cmake_available() || !available("git") {
         return;

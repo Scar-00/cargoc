@@ -33,6 +33,7 @@
 ---@field rev ?string Git tag, branch, or commit; resolved commits are pinned in cargoc.lock.
 ---@field subdir ?string Relative project directory within the dependency.
 ---@field build_system ?"cargoc"|"cmake" Override automatic build-system detection.
+---@field cmake_generator ?string CMake generator, for example Ninja or NMake Makefiles.
 ---@field cmake_options ?table<string, string|boolean|number> CMake cache options.
 ---@field tool_chain ?ToolChain CMake compiler selection; Gcc, Clang, or Msvc.
 
