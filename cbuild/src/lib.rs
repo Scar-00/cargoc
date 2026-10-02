@@ -1,6 +1,7 @@
 use std::{ffi::OsString, path::Path};
 
 pub mod database;
+pub mod external;
 pub mod file;
 pub mod graph;
 
@@ -42,4 +43,17 @@ impl CommandExt for tokio::process::Command {
     fn display(&self) -> String {
         self.as_std().display()
     }
+}
+
+/// Include argument boundaries so different command lines cannot share a cache key.
+pub(crate) fn command_fingerprint(command: &tokio::process::Command) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    let command = command.as_std();
+    for argument in std::iter::once(command.get_program()).chain(command.get_args()) {
+        let bytes = argument.as_encoded_bytes();
+        digest.update(bytes.len().to_le_bytes());
+        digest.update(bytes);
+    }
+    format!("{:x}", digest.finalize())
 }

@@ -27,6 +27,15 @@
 ---@class Project
 ---@field artifact fun(self: Project, name: string): Binary
 
+---@class ProjectOptions
+---@field path ?string Local project directory; specify exactly one of path or git.
+---@field git ?string Git URL or local Git repository.
+---@field rev ?string Git tag, branch, or commit; resolved commits are pinned in cargoc.lock.
+---@field subdir ?string Relative project directory within the dependency.
+---@field build_system ?"cargoc"|"cmake" Override automatic build-system detection.
+---@field cmake_options ?table<string, string|boolean|number> CMake cache options.
+---@field tool_chain ?ToolChain CMake compiler selection; currently Gcc or Clang.
+
 ---@class Graph
 ---@field name string
 ---@field tool_chain ToolChain
@@ -45,7 +54,7 @@
 
 ---@class Build
 ---@field add_binary fun(self: Build, binary: Graph): Binary
----@field use_project async fun(self: Build, path: string): Project
+---@field use_project async fun(self: Build, source: string|ProjectOptions): Project
 ---@field install async fun(self: Build, join_handle: JoinHandle): BuildArtifact
 ---@field default_toolchain fun(self: Build): ToolChain
 ---@field default_opt_level fun(self: Build): OptimizationLevel
@@ -54,5 +63,9 @@
 ---@field host_os fun(self: Build): Os
 ---@field should_generate_database fun(self: Build): boolean
 ---@field generate_database async fun(self: Build, path: string?): boolean
----@field read_dir async fun(path: string, ext: string?): string[]
+---@field read_dir async fun(self: Build, path: string, ext: string?): string[]
 ---@field unused_cli_args fun(self: Build): string[]
+
+---Global build context supplied to every build.lua script by cargoc.
+---@type Build
+build = {}

@@ -15,6 +15,7 @@ use crate::{
     CommandExt,
     database::Database,
     display_path, display_path_relative,
+    external::ExternalBuild,
     file::{InputFile, OutputFile},
 };
 
@@ -124,6 +125,14 @@ impl ToolChain {
             Self::Msvc => "cl.exe",
             Self::Zig => "zig",
             Self::Custom { compiler, .. } => compiler,
+        }
+    }
+
+    pub fn cxx_compiler(&self) -> &str {
+        match self {
+            Self::Gcc => "g++",
+            Self::Clang => "clang++",
+            _ => self.compiler(),
         }
     }
 
@@ -266,6 +275,8 @@ pub struct Graph {
     pub full_rebuild: bool,
     #[serde(skip)]
     pub project_root: PathBuf,
+    #[serde(skip)]
+    pub external: Option<ExternalBuild>,
 }
 
 #[derive(Debug, Clone)]
@@ -386,6 +397,10 @@ impl Graph {
 
     pub async fn build_with_registry(&self, registry: &BuildRegistry) -> Result<PathBuf> {
         self.validate_dependencies(registry)?;
+        if let Some(external) = &self.external {
+            external.build(self.full_rebuild).await?;
+            return Ok(self.output_path());
+        }
 
         if let Ok(exists) = fs::try_exists(Self::CACHE_DIR).await
             && !exists
@@ -420,8 +435,14 @@ impl Graph {
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
 
-        let dep_outputs = self.transitive_static_lib_outputs(registry)?;
-        self.link(&output_files, &dep_outputs).await
+        let mut dep_outputs = self.transitive_static_lib_outputs(registry)?;
+        let cxx = self.requires_cxx(registry).await?;
+        for id in registry.dependency_order(self.id)? {
+            if let Some(external) = &registry.require(id)?.external {
+                dep_outputs.extend(external.usage(cxx).link_inputs.clone());
+            }
+        }
+        self.link(&output_files, &dep_outputs, registry, cxx).await
     }
 
     pub fn transitive_public_includes(&self, registry: &BuildRegistry) -> Result<Vec<PathBuf>> {
@@ -446,9 +467,9 @@ impl Graph {
         let mut seen = HashSet::new();
         let order = registry.dependency_order(self.id)?;
 
-        for dep_id in order.into_iter().filter(|dep_id| *dep_id != self.id) {
+        for dep_id in order.into_iter().rev().filter(|dep_id| *dep_id != self.id) {
             let dep = registry.require(dep_id)?;
-            if dep.typ == BinaryType::StaticLib {
+            if dep.typ == BinaryType::StaticLib && dep.external.is_none() {
                 let output = dep.output_path();
                 if seen.insert(output.clone()) {
                     outputs.push(output);
@@ -459,25 +480,73 @@ impl Graph {
         Ok(outputs)
     }
 
-    async fn link(&self, files: &[OutputFile], dep_outputs: &[PathBuf]) -> Result<PathBuf> {
-        if !self.should_recompile(files, dep_outputs).await? {
+    async fn requires_cxx(&self, registry: &BuildRegistry) -> Result<bool> {
+        for id in registry.dependency_order(self.id)? {
+            let graph = registry.require(id)?;
+            if let Some(external) = &graph.external {
+                if external.c.requires_cxx {
+                    return Ok(true);
+                }
+            } else if graph
+                .input_files(registry)
+                .await?
+                .iter()
+                .any(InputFile::is_cxx)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn link(
+        &self,
+        files: &[OutputFile],
+        dep_outputs: &[PathBuf],
+        registry: &BuildRegistry,
+        cxx: bool,
+    ) -> Result<PathBuf> {
+        let linker = if cxx
+            && self.typ != BinaryType::StaticLib
+            && matches!(
+                self.tool_chain,
+                ToolChain::Gcc | ToolChain::Clang | ToolChain::Zig
+            ) {
+            self.tool_chain.cxx_compiler()
+        } else {
+            self.tool_chain.linker(&self.typ)
+        };
+        let mut cmd = Command::new(linker);
+        if self.tool_chain == ToolChain::Zig && self.typ == BinaryType::Executable {
+            cmd.arg(if cxx { "c++" } else { "cc" });
+        }
+
+        self.append_out(&mut cmd);
+        self.append_files(&mut cmd, files);
+        self.append_dependency_outputs(&mut cmd, &self.transitive_static_lib_outputs(registry)?);
+        if self.typ != BinaryType::StaticLib {
+            for id in registry.dependency_order(self.id)?.into_iter().rev() {
+                if id != self.id
+                    && let Some(external) = &registry.require(id)?.external
+                {
+                    cmd.args(&external.usage(cxx).link_args);
+                }
+            }
+        }
+        self.append_args(&mut cmd);
+        self.append_libs(&mut cmd);
+
+        let fingerprint = crate::command_fingerprint(&cmd);
+        let signature_path = Path::new(Self::CACHE_DIR).join(format!("link-{}", self.id));
+        if fs::read_to_string(&signature_path).await.ok().as_deref() == Some(fingerprint.as_str())
+            && !self.should_recompile(files, dep_outputs).await?
+        {
             tracing::info!(
                 "{} is up to date",
                 display_path_relative(&self.output_path(), &self.project_root)
             );
             return Ok(self.output_path());
         }
-
-        let mut cmd = Command::new(self.tool_chain.linker(&self.typ));
-        if self.tool_chain == ToolChain::Zig && self.typ == BinaryType::Executable {
-            cmd.arg("cc");
-        }
-
-        self.append_out(&mut cmd);
-        self.append_files(&mut cmd, files);
-        self.append_dependency_outputs(&mut cmd, dep_outputs);
-        self.append_args(&mut cmd);
-        self.append_libs(&mut cmd);
 
         tracing::info!(
             "[Linking]: {}",
@@ -502,6 +571,7 @@ impl Graph {
             _ => {}
         }
 
+        fs::write(signature_path, fingerprint).await?;
         Ok(self.output_path())
     }
 
@@ -527,21 +597,29 @@ impl Graph {
 
         let includes = self.compile_includes(registry)?;
 
-        Ok(input_files
+        input_files
             .into_iter()
             .map(|file| {
-                let output = Self::object_path(&file, &self.tool_chain);
-                InputFile::new(
+                let mut args = self.args.clone();
+                let is_cxx = InputFile::path_is_cxx(&file);
+                for id in registry.dependency_order(self.id)? {
+                    if let Some(external) = &registry.require(id)?.external {
+                        args.custom
+                            .extend(external.usage(is_cxx).compile_args.clone());
+                    }
+                }
+                let output = Self::object_path(&file, &self.tool_chain, self.id);
+                Ok(InputFile::new(
                     file,
                     output,
                     self.tool_chain.clone(),
-                    self.args.clone(),
+                    args,
                     includes.clone(),
                     self.full_rebuild,
                     self.project_root.clone(),
-                )
+                ))
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     fn compile_includes(&self, registry: &BuildRegistry) -> Result<Vec<PathBuf>> {
@@ -617,9 +695,10 @@ impl Graph {
         }
     }
 
-    fn object_path(path: &Path, tool_chain: &ToolChain) -> PathBuf {
+    fn object_path(path: &Path, tool_chain: &ToolChain, artifact_id: usize) -> PathBuf {
         let mut hasher = Sha224::new();
         hasher.update(path.display().to_string().as_bytes());
+        hasher.update(artifact_id.to_le_bytes());
         let stem = path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -669,6 +748,12 @@ impl Graph {
     }
 
     pub fn output_path(&self) -> PathBuf {
+        if let Some(external) = &self.external {
+            return external
+                .artifact
+                .clone()
+                .unwrap_or_else(|| external.build_dir.clone());
+        }
         if cfg!(target_os = "windows") {
             let ext = match self.typ {
                 BinaryType::Executable => "exe",
@@ -738,6 +823,7 @@ mod tests {
             deps,
             full_rebuild: false,
             project_root: PathBuf::new(),
+            external: None,
         }
     }
 
@@ -774,8 +860,8 @@ mod tests {
         assert_eq!(
             libs,
             vec![
-                PathBuf::from(format!("core.{expected_ext}")),
                 PathBuf::from(format!("ui.{expected_ext}")),
+                PathBuf::from(format!("core.{expected_ext}")),
             ]
         );
     }

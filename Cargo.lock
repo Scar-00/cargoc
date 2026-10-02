@@ -115,6 +115,8 @@ dependencies = [
  "path-absolutize",
  "serde",
  "serde_json",
+ "sha2",
+ "shlex",
  "tokio",
  "tracing",
  "tracing-subscriber",

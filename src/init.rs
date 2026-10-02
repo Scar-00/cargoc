@@ -18,34 +18,31 @@ struct ProjectTemplate {
 
 fn binary_template(name: &str) -> ProjectTemplate {
     let build_lua = format!(
-        r#"---@param build Build
-return function (build)
-    local tool_chain = "Clang";
-    local warnings = {{ "Error", "Pedantic", "All", "Extra" }};
-    local no_warnings = {{ "DeprecatedDeclarations" }};
+        r#"local tool_chain = "Clang";
+local warnings = {{ "Error", "Pedantic", "All", "Extra" }};
+local no_warnings = {{ "DeprecatedDeclarations" }};
 
-    local main = build:add_binary({{
-        name = "{name}",
-        tool_chain = tool_chain,
-        opt_level = build:default_opt_level(),
-        files = {{
-            "src/main.c"
-        }},
-        output = "{name}",
-        args = {{
-            warnings = warnings,
-            no_warnings = no_warnings,
-        }}
-    }});
+local main = build:add_binary({{
+    name = "{name}",
+    tool_chain = tool_chain,
+    opt_level = build:default_opt_level(),
+    files = {{
+        "src/main.c"
+    }},
+    output = "{name}",
+    args = {{
+        warnings = warnings,
+        no_warnings = no_warnings,
+    }}
+}});
 
-    if build:should_generate_database() then
-        return build:generate_database();
-    end
+if build:should_generate_database() then
+    return build:generate_database();
+end
 
-    local exe = main:build_and_install();
-    if exe and build:wants_run() then
-        build:run(exe, {{ }});
-    end
+local exe = main:build_and_install();
+if exe and build:wants_run() then
+    build:run(exe, {{ }});
 end
 "#
     );
@@ -71,24 +68,21 @@ fn library_template(name: &str) -> ProjectTemplate {
     let guard = to_upper_identifier(name);
 
     let build_lua = format!(
-        r#"---@param build Build
-return function (build)
-    local {id} = build:add_binary({{
-        name = "{name}",
-        tool_chain = "Clang",
-        opt_level = build:default_opt_level(),
-        type = "StaticLib",
-        files = {{
-            "src/{id}.c"
-        }},
-        output = "{name}",
-        public_includes = {{
-            "include"
-        }},
-    }});
+        r#"local {id} = build:add_binary({{
+    name = "{name}",
+    tool_chain = "Clang",
+    opt_level = build:default_opt_level(),
+    type = "StaticLib",
+    files = {{
+        "src/{id}.c"
+    }},
+    output = "{name}",
+    public_includes = {{
+        "include"
+    }},
+}});
 
-    {id}:export();
-end
+{id}:export();
 "#
     );
 

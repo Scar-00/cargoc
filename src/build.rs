@@ -1,3 +1,4 @@
+use crate::dependency::ProjectSpec;
 use cbuild::{
     display_path,
     graph::{self, BuildRegistry, OptimizationLevel, Os, ToolChain},
@@ -6,20 +7,35 @@ use mlua::prelude::*;
 use path_absolutize::Absolutize;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
-    collections::HashMap, panic::UnwindSafe, path::{Path, PathBuf}, sync::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
-    }
+    },
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::{process::Command, task::JoinHandle};
 
 static NEXT_SESSION_ID: AtomicUsize = AtomicUsize::new(1);
-const BUILD_GLOBAL_KEY: &str = "build";
+pub(crate) const BUILD_GLOBAL_KEY: &str = "build";
 
-pub(crate) async fn load_script(lua: &Lua, path: &Path) -> LuaResult<LuaFunction> {
+pub(crate) async fn load_script(lua: &Lua, path: &Path) -> LuaResult<()> {
     let source = tokio::fs::read(path).await.map_err(mlua::Error::external)?;
-    lua.load(&source).eval_async().await
+    let result = lua
+        .load(&source)
+        .set_name(display_path(path))
+        .into_function()?
+        .call_async::<LuaValue>(())
+        .await
+        .map_err(|error| mlua::Error::runtime(format!("{}: {error}", display_path(path))))?;
+    if matches!(result, LuaValue::Function(_)) {
+        return Err(mlua::Error::runtime(format!(
+            "{}: build scripts now execute directly with the global `build`; remove the returned function wrapper",
+            display_path(path)
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -175,7 +191,10 @@ impl GraphHandle {
 
         Ok(BuildArtifact {
             name: graph.name.clone(),
-            path: Some(graph.output_path()),
+            path: graph.external.as_ref().map_or_else(
+                || Some(graph.output_path()),
+                |external| external.artifact.clone(),
+            ),
         })
     }
 }
@@ -270,9 +289,14 @@ impl LuaUserData for ProjectHandle {
             })?;
             let Some(artifact_id) = project.export_names.get(&name).copied() else {
                 return Err(mlua::Error::runtime(format!(
-                    "project `{}` does not export artifact `{}`",
+                    "project `{}` does not export artifact `{}`; available artifacts: {}",
                     display_path(&project.root_dir),
-                    name
+                    name,
+                    {
+                        let mut names: Vec<_> = project.export_names.keys().cloned().collect();
+                        names.sort();
+                        names.join(", ")
+                    }
                 )));
             };
 
@@ -524,6 +548,7 @@ impl Build {
             deps: spec.deps,
             full_rebuild: state.args.full_rebuild,
             project_root,
+            external: None,
         };
 
         state.binaries.push(GraphEntry {
@@ -584,7 +609,7 @@ impl Build {
         if let Some(project) = state
             .projects
             .iter()
-            .find(|project| project.root_dir == root_dir)
+            .find(|project| project.script_path == script_path)
         {
             return Ok(Ok(ProjectHandle {
                 project_id: project.id,
@@ -647,44 +672,181 @@ impl Build {
     }
 
     async fn evaluate_project_script(&self, lua: &Lua, script_path: &Path) -> LuaResult<()> {
-        let out = load_script(lua, script_path).await?;
-        let build_ud: LuaAnyUserData = lua.globals().get(BUILD_GLOBAL_KEY)?;
-        out.call_async::<()>(build_ud).await
+        load_script(lua, script_path).await
     }
 
-    async fn use_project_inner(&self, lua: &Lua, path: String) -> LuaResult<ProjectHandle> {
+    async fn use_project_inner(&self, lua: &Lua, spec: ProjectSpec) -> LuaResult<ProjectHandle> {
+        spec.validate().into_lua_err()?;
         let (_, _, current_root) = self.current_project_context()?;
-        let root_dir = Self::resolve_existing_project_dir(&current_root, &path).await?;
-        let script_path = root_dir.join("build.lua");
-        if !tokio::fs::try_exists(&script_path)
-            .await
-            .map_err(mlua::Error::external)?
-        {
+        let (root, configuration) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| mlua::Error::runtime("build state lock poisoned"))?;
+            let root = state
+                .project(state.root_project_id)
+                .ok_or_else(|| mlua::Error::runtime("root project not found"))?
+                .root_dir
+                .clone();
+            (
+                root,
+                if state.args.release {
+                    "Release"
+                } else {
+                    "Debug"
+                },
+            )
+        };
+        let source = if let Some(git) = &spec.git {
+            // A local Git repository is resolved relative to its importing project.
+            let url = if !git.contains("://") && !git.contains(':') {
+                let candidate = current_root.join(git);
+                let absolute = candidate.absolutize().into_lua_err()?.to_path_buf();
+                display_path(&absolute)
+            } else {
+                git.clone()
+            };
+            crate::dependency::git_source(&root, &url, spec.rev.as_deref())
+                .await
+                .into_lua_err()?
+        } else {
+            Self::resolve_existing_project_dir(&current_root, spec.path.as_deref().unwrap()).await?
+        };
+        let root_dir = if let Some(subdir) = &spec.subdir {
+            let subdir = Self::resolve_existing_project_dir(&source, &display_path(subdir)).await?;
+            if !subdir.starts_with(&source) {
+                return Err(mlua::Error::runtime(
+                    "dependency subdir escapes its source directory",
+                ));
+            }
+            subdir
+        } else {
+            source
+        };
+        let system = match spec.build_system.as_deref() {
+            Some(system) => system,
+            None if tokio::fs::try_exists(root_dir.join("build.lua")).await? => "cargoc",
+            None if tokio::fs::try_exists(root_dir.join("CMakeLists.txt")).await? => "cmake",
+            None => {
+                return Err(mlua::Error::runtime(format!(
+                    "no supported build script in {}; expected build.lua or CMakeLists.txt (other build systems are not supported yet)",
+                    display_path(&root_dir)
+                )));
+            }
+        };
+        if system == "cargoc" && (!spec.cmake_options.is_empty() || spec.tool_chain.is_some()) {
+            return Err(mlua::Error::runtime(
+                "cmake_options and tool_chain are only valid for CMake imports",
+            ));
+        }
+        let cache_dir = if system == "cmake" {
+            Some(crate::cmake::project_dir(&root, &root_dir, &spec, configuration).into_lua_err()?)
+        } else {
+            None
+        };
+        let script_path = cache_dir
+            .as_ref()
+            .map(|dir| dir.join("wrapper/CMakeLists.txt"))
+            .unwrap_or_else(|| root_dir.join("build.lua"));
+        if cache_dir.is_none() && !tokio::fs::try_exists(&script_path).await? {
             return Err(mlua::Error::runtime(format!(
                 "imported project build script does not exist: {}",
                 display_path(&script_path)
             )));
         }
-
-        match self.begin_project_load(root_dir, script_path.clone())? {
+        match self.begin_project_load(root_dir.clone(), script_path)? {
             Ok(existing) => Ok(existing),
             Err(pending) => {
-                let result = self
-                    .evaluate_project_script(lua, &pending.script_path)
-                    .await;
+                let result = if let Some(cache_dir) = cache_dir {
+                    self.import_cmake(
+                        &root_dir,
+                        &cache_dir,
+                        &spec,
+                        configuration,
+                        pending.project_id,
+                    )
+                    .await
+                } else {
+                    self.evaluate_project_script(lua, &pending.script_path)
+                        .await
+                };
                 match result {
                     Ok(()) => self.finish_project_load(&pending),
                     Err(error) => {
                         self.rollback_project_load(&pending)?;
                         Err(mlua::Error::runtime(format!(
-                            "failed to evaluate imported project `{}`: {}",
-                            display_path(&pending.script_path),
+                            "failed to import project `{}`: {}",
+                            display_path(&root_dir),
                             error
                         )))
                     }
                 }
             }
         }
+    }
+
+    async fn import_cmake(
+        &self,
+        source: &Path,
+        cache_dir: &Path,
+        spec: &ProjectSpec,
+        configuration: &str,
+        project_id: usize,
+    ) -> LuaResult<()> {
+        let targets = crate::cmake::configure(source, cache_dir, spec, configuration)
+            .await
+            .into_lua_err()?;
+        for target in targets {
+            let handle = self.push_graph(
+                GraphSpec {
+                    name: target.name.clone(),
+                    tool_chain: spec
+                        .tool_chain
+                        .clone()
+                        .unwrap_or_else(ToolChain::platform_default),
+                    opt_level: if configuration == "Release" {
+                        OptimizationLevel::Release
+                    } else {
+                        OptimizationLevel::Debug
+                    },
+                    typ: graph::BinaryType::StaticLib,
+                    files: Vec::new(),
+                    output: target
+                        .external
+                        .artifact
+                        .clone()
+                        .unwrap_or_else(|| cache_dir.to_path_buf()),
+                    src_dir: source.to_path_buf(),
+                    includes: Vec::new(),
+                    public_includes: Vec::new(),
+                    lib_paths: Vec::new(),
+                    libs: Vec::new(),
+                    args: graph::CompilerFlags::default(),
+                    excludes: None,
+                    deps: Vec::new(),
+                },
+                project_id,
+            )?;
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| mlua::Error::runtime("build state lock poisoned"))?;
+            let graph = state
+                .binaries
+                .iter_mut()
+                .find(|graph| graph.id == handle.id)
+                .unwrap();
+            graph.inner.external = Some(target.external);
+            graph.exported_as = Some(target.name.clone());
+            state
+                .projects
+                .iter_mut()
+                .find(|project| project.id == project_id)
+                .unwrap()
+                .export_names
+                .insert(target.name, handle.id);
+        }
+        Ok(())
     }
 
     async fn generate_database(
@@ -737,7 +899,7 @@ impl Build {
 #[derive(Default, Serialize, Deserialize)]
 struct RunOptions {
     silent: Option<bool>,
-    args: Option<Vec<String>>
+    args: Option<Vec<String>>,
 }
 
 impl LuaUserData for Build {
@@ -752,11 +914,20 @@ impl LuaUserData for Build {
             let spec = Self::parse_graph_spec(lua, table, session_id, &project_root)?;
             this.push_graph(spec, project_id)
         });
-        methods.add_async_method("use_project", |lua, this, path: String| {
+        methods.add_async_method("use_project", |lua, this, value: LuaValue| {
+            let spec = match value {
+                LuaValue::String(source) => source
+                    .to_str()
+                    .map(|source| ProjectSpec::from_source(source.to_string())),
+                LuaValue::Table(table) => lua.from_value::<ProjectSpec>(LuaValue::Table(table)),
+                _ => Err(mlua::Error::runtime(
+                    "use_project expects a path, Git URL, or options table",
+                )),
+            };
             let build = Build {
                 state: Arc::clone(&this.state),
             };
-            async move { build.use_project_inner(&lua, path).await }
+            async move { build.use_project_inner(&lua, spec?).await }
         });
         methods.add_async_method_mut(
             "install",
@@ -838,32 +1009,31 @@ impl LuaUserData for Build {
                     Ok(mut process) => {
                         if let (Some(stdout), Some(stderr)) =
                             (process.stdout.take(), process.stderr.take())
+                            && !silent
                         {
-                            if !silent {
-                                let exe_name = raw_binary
-                                    .file_name()
-                                    .map(|name| name.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| display_path(&raw_binary));
-                                tokio::spawn({
-                                    let exe_name = exe_name.clone();
-                                    async move {
-                                        let reader = BufReader::new(stdout);
-                                        let mut lines = reader.lines();
-                                        while let Ok(Some(line)) = lines.next_line().await {
-                                            let out = format!("[{exe_name}]: {line}\n");
-                                            _ = tokio::io::stdout().write_all(out.as_bytes()).await;
-                                        }
-                                    }
-                                });
-                                tokio::spawn(async move {
-                                    let reader = BufReader::new(stderr);
+                            let exe_name = raw_binary
+                                .file_name()
+                                .map(|name| name.to_string_lossy().to_string())
+                                .unwrap_or_else(|| display_path(&raw_binary));
+                            tokio::spawn({
+                                let exe_name = exe_name.clone();
+                                async move {
+                                    let reader = BufReader::new(stdout);
                                     let mut lines = reader.lines();
                                     while let Ok(Some(line)) = lines.next_line().await {
                                         let out = format!("[{exe_name}]: {line}\n");
-                                        _ = tokio::io::stderr().write_all(out.as_bytes()).await;
+                                        _ = tokio::io::stdout().write_all(out.as_bytes()).await;
                                     }
-                                });
-                            }
+                                }
+                            });
+                            tokio::spawn(async move {
+                                let reader = BufReader::new(stderr);
+                                let mut lines = reader.lines();
+                                while let Ok(Some(line)) = lines.next_line().await {
+                                    let out = format!("[{exe_name}]: {line}\n");
+                                    _ = tokio::io::stderr().write_all(out.as_bytes()).await;
+                                }
+                            });
                         }
                         if let Ok(status) = process.wait().await {
                             Some(status.success())
@@ -944,8 +1114,7 @@ mod tests {
         let script_path = build.root_script_path()?;
         let userdata = lua.create_userdata(build)?;
         lua.globals().set(BUILD_GLOBAL_KEY, userdata.clone())?;
-        let out = load_script(&lua, &script_path).await?;
-        out.call_async::<()>(userdata.clone()).await?;
+        load_script(&lua, &script_path).await?;
         let build = userdata.take::<Build>()?;
         build.finish_root_load()?;
         Ok(build)
@@ -960,18 +1129,16 @@ mod tests {
         fs::write(
             dep.join("build.lua"),
             r#"
-return function(build)
-    local core = build:add_binary({
-        name = "core",
-        tool_chain = "Clang",
-        opt_level = build:default_opt_level(),
-        type = "StaticLib",
-        files = { "src/core.c" },
-        public_includes = { "include" },
-        output = "core",
-    })
-    core:export()
-end
+local core = build:add_binary({
+    name = "core",
+    tool_chain = "Clang",
+    opt_level = build:default_opt_level(),
+    type = "StaticLib",
+    files = { "src/core.c" },
+    public_includes = { "include" },
+    output = "core",
+})
+core:export()
 "#,
         )
         .unwrap();
@@ -982,19 +1149,17 @@ end
         fs::write(
             root.join("build.lua"),
             r#"
-return function(build)
-    local dep1 = build:use_project("./dep")
-    local dep2 = build:use_project("./dep")
-    local core = dep2:artifact("core")
-    build:add_binary({
-        name = "app",
-        tool_chain = "Clang",
-        opt_level = build:default_opt_level(),
-        files = { "src/main.c" },
-        output = "app",
-        deps = { core },
-    })
-end
+local dep1 = build:use_project("./dep")
+local dep2 = build:use_project("./dep")
+local core = dep2:artifact("core")
+build:add_binary({
+    name = "app",
+    tool_chain = "Clang",
+    opt_level = build:default_opt_level(),
+    files = { "src/main.c" },
+    output = "app",
+    deps = { core },
+})
 "#,
         )
         .unwrap();
@@ -1019,16 +1184,14 @@ end
         fs::write(
             dep.join("build.lua"),
             r#"
-return function(build)
-    build:add_binary({
-        name = "core",
-        tool_chain = "Clang",
-        opt_level = build:default_opt_level(),
-        type = "StaticLib",
-        files = { "src/core.c" },
-        output = "core",
-    })
-end
+build:add_binary({
+    name = "core",
+    tool_chain = "Clang",
+    opt_level = build:default_opt_level(),
+    type = "StaticLib",
+    files = { "src/core.c" },
+    output = "core",
+})
 "#,
         )
         .unwrap();
@@ -1036,10 +1199,8 @@ end
         fs::write(
             root.join("build.lua"),
             r#"
-return function(build)
-    local dep = build:use_project("./dep")
-    dep:artifact("core")
-end
+local dep = build:use_project("./dep")
+dep:artifact("core")
 "#,
         )
         .unwrap();
@@ -1058,16 +1219,8 @@ end
         let b = root.join("b");
         fs::create_dir_all(&a).unwrap();
         fs::create_dir_all(&b).unwrap();
-        fs::write(
-            a.join("build.lua"),
-            "return function(build)\n    build:use_project(\"../b\")\nend\n",
-        )
-        .unwrap();
-        fs::write(
-            b.join("build.lua"),
-            "return function(build)\n    build:use_project(\"../a\")\nend\n",
-        )
-        .unwrap();
+        fs::write(a.join("build.lua"), "build:use_project(\"../b\")\n").unwrap();
+        fs::write(b.join("build.lua"), "build:use_project(\"../a\")\n").unwrap();
 
         let err = run_build_script(a.join("build.lua"))
             .await
@@ -1085,27 +1238,21 @@ end
         fs::write(
             dep.join("build.lua"),
             r#"
-return function(build)
-    local core = build:add_binary({
-        name = "core",
-        tool_chain = "Clang",
-        opt_level = build:default_opt_level(),
-        type = "StaticLib",
-        files = { "src/core.c" },
-        public_includes = { "include" },
-        output = "core",
-    })
-    core:export()
-end
+local core = build:add_binary({
+    name = "core",
+    tool_chain = "Clang",
+    opt_level = build:default_opt_level(),
+    type = "StaticLib",
+    files = { "src/core.c" },
+    public_includes = { "include" },
+    output = "core",
+})
+core:export()
 "#,
         )
         .unwrap();
         fs::write(dep.join("src").join("core.c"), "int core(void){return 1;}").unwrap();
-        fs::write(
-            root.join("build.lua"),
-            "return function(build)\n    build:use_project(\"./dep\")\nend\n",
-        )
-        .unwrap();
+        fs::write(root.join("build.lua"), "build:use_project(\"./dep\")\n").unwrap();
 
         let build = run_build_script(root.join("build.lua")).await.unwrap();
         let state = build.state.lock().unwrap();

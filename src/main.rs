@@ -1,4 +1,6 @@
 mod build;
+mod cmake;
+mod dependency;
 mod init;
 
 use anyhow::Result;
@@ -140,10 +142,9 @@ async fn main() -> Result<ExitCode> {
     let build = Build::new(args.clone())?;
     let script_path = build.root_script_path()?;
     let build = lua.create_userdata(build)?;
-    lua.globals().set("build", build.clone())?;
+    lua.globals().set(build::BUILD_GLOBAL_KEY, build.clone())?;
 
-    let out = build::load_script(&lua, &script_path).await?;
-    let res = out.call_async::<()>(&build).await;
+    let res = build::load_script(&lua, &script_path).await;
     if let Ok(build_ref) = build.borrow::<Build>() {
         let _ = build_ref.finish_root_load();
     }

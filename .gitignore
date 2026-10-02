@@ -1,2 +1,7 @@
 /target
 /main.exe
+/.cargoc/
+/main
+/example/core_project/core.a
+/example/core_project/core.lib
+/compile_commands.json
